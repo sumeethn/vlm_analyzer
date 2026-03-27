@@ -1,0 +1,56 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      TEMP_DIR: /tmp/vlm_jobs
+      VIDEO_MOUNT: /data/videos
+      ENABLE_NVDEC: "0"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - job_temp:/tmp/vlm_jobs
+      - ./samples:/data/videos:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: celery -A app.worker.celery_app worker --loglevel=info --concurrency=2
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      TEMP_DIR: /tmp/vlm_jobs
+      VIDEO_MOUNT: /data/videos
+      ENABLE_NVDEC: "0"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - job_temp:/tmp/vlm_jobs
+      - ./samples:/data/videos:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  redis_data:
+  job_temp:
