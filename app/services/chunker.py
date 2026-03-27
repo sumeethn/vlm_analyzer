@@ -45,10 +45,11 @@ def nvdec_input_prefix(*, use_nvdec: bool) -> list[str]:
 
 
 def rtsp_input_options() -> list[str]:
+    # Socket I/O timeout in microseconds (replaces deprecated -stimeout in current FFmpeg).
     return [
         "-rtsp_transport",
         "tcp",
-        "-stimeout",
+        "-timeout",
         "5000000",
     ]
 
