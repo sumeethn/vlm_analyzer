@@ -16,7 +16,11 @@ class CreateStreamRequest(BaseModel):
     )
     frames_per_chunk: int | None = Field(
         default=None,
-        description="Override server default; samples this many frames per chunk window for the VLM.",
+        ge=1,
+        description=(
+            "When set, overrides FRAMES_PER_CHUNK; must be <= server MAX_FRAMES_PER_CHUNK. "
+            "Number of frames sampled per chunk window for the VLM."
+        ),
     )
     ollama_options: dict[str, Any] | None = None
 

@@ -4,6 +4,7 @@ import logging
 import shutil
 import subprocess
 import threading
+import uuid
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -96,7 +97,7 @@ def probe_duration_seconds(path: str) -> float | None:
             ],
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=15,
             check=False,
         )
         if r.returncode != 0:
@@ -116,8 +117,12 @@ def build_input_args(uri: str, kind: str, *, use_nvdec: bool) -> list[str]:
     return opts
 
 
+def _jpg_fps_rate(chunk_seconds: float, frames_per_chunk: int) -> float:
+    return frames_per_chunk / max(chunk_seconds, 0.5)
+
+
 def _jpg_vf_fps(chunk_seconds: float, frames_per_chunk: int, *, use_nvdec: bool) -> str:
-    fps = frames_per_chunk / max(chunk_seconds, 0.5)
+    fps = _jpg_fps_rate(chunk_seconds, frames_per_chunk)
     if use_nvdec and detect_cuda_hwaccel_available():
         return f"hwdownload,format=nv12,fps={fps}"
     return f"fps={fps}"
@@ -135,6 +140,7 @@ def segment_to_jpg(
 ) -> list[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     pattern = str(out_dir / "chunk_%06d.jpg")
+    fps_rate = _jpg_fps_rate(chunk_seconds, frames_per_chunk)
     vf = _jpg_vf_fps(chunk_seconds, frames_per_chunk, use_nvdec=use_nvdec)
     frame_cap: list[str] = []
     if max_chunks is not None:
@@ -159,7 +165,7 @@ def segment_to_jpg(
             *build_input_args(uri, kind, use_nvdec=False),
             "-an",
             "-vf",
-            f"fps={frames_per_chunk / max(chunk_seconds, 0.5)}",
+            f"fps={fps_rate}",
             *frame_cap,
             "-q:v",
             "3",
@@ -182,8 +188,17 @@ def extract_spaced_jpegs_from_mp4(
     if n < 1:
         raise ValueError("n must be >= 1")
     out_dir.mkdir(parents=True, exist_ok=True)
+    for stale in out_dir.glob(f"{stem}_*.jpg"):
+        try:
+            stale.unlink()
+        except OSError:
+            pass
     pattern = str(out_dir / f"{stem}_%03d.jpg")
-    duration = probe_duration_seconds(str(mp4_path)) or 1.0
+    duration = probe_duration_seconds(str(mp4_path))
+    if duration is None:
+        raise RuntimeError(
+            f"could not determine duration for {mp4_path} (ffprobe failed or missing duration)"
+        )
     fps = n / max(duration, 0.01)
     vf_soft = f"fps={fps}"
     attempts: list[list[str]] = []
@@ -310,7 +325,7 @@ def extract_representative_jpeg(
     use_nvdec: bool,
 ) -> None:
     out_jpg.parent.mkdir(parents=True, exist_ok=True)
-    tmp_stem = f"{out_jpg.stem}_one"
+    tmp_stem = f"{out_jpg.stem}_repr_{uuid.uuid4().hex[:8]}"
     paths = extract_spaced_jpegs_from_mp4(
         mp4_path,
         out_dir=out_jpg.parent,

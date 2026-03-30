@@ -16,6 +16,27 @@ from tenacity import (
 
 logger = logging.getLogger(__name__)
 
+_TOP_LEVEL_FORBIDDEN = frozenset({"messages", "model", "stream"})
+
+
+def merge_ollama_chat_options(
+    payload: dict[str, Any],
+    options: dict[str, Any] | None,
+) -> None:
+    """Merge runtime fields into payload[\"options\"] for Ollama /api/chat."""
+    if not options:
+        return
+    merged: dict[str, Any] = dict(payload.get("options") or {})
+    for k, v in options.items():
+        if k in _TOP_LEVEL_FORBIDDEN:
+            continue
+        if k == "options" and isinstance(v, dict):
+            merged.update(v)
+        elif k != "options":
+            merged[k] = v
+    if merged:
+        payload["options"] = merged
+
 
 def _is_retryable(exc: BaseException) -> bool:
     if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError)):
@@ -60,11 +81,7 @@ def ollama_chat_vision(
         ],
         "stream": False,
     }
-    if options:
-        for k, v in options.items():
-            if k in {"messages", "model", "stream"}:
-                continue
-            payload[k] = v
+    merge_ollama_chat_options(payload, options)
     with httpx.Client(timeout=timeout_seconds) as client:
         r = client.post(f"{base}/api/chat", json=payload)
         r.raise_for_status()

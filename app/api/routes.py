@@ -30,6 +30,7 @@ from app.schemas.streams import (
 from app.services.openai_compat import ollama_to_openai_chat_completion
 from app.services.vlm import (
     extract_text_and_image_b64_from_openai_messages,
+    merge_ollama_chat_options,
     ollama_chat_vision,
 )
 from app.state.insights import InsightStore
@@ -209,9 +210,9 @@ async def register_stream(
 async def list_streams(settings: Settings = Depends(get_settings)) -> list[StreamListItem]:
     stream_store = StreamStore(settings)
     stream_store.reconcile_active_set()
+    ids = stream_store.list_active_ids()
     items: list[StreamListItem] = []
-    for sid in stream_store.list_active_ids():
-        s = stream_store.get(sid)
+    for s in stream_store.get_many(ids):
         if not s:
             continue
         if s.get("status") not in ("active", "stopping"):
@@ -284,6 +285,11 @@ def _build_insights_response(
         try:
             recs.append(InsightRecord.model_validate(r))
         except Exception:
+            logger.warning(
+                "skipping malformed insight record insight_id=%s",
+                r.get("insight_id"),
+                exc_info=True,
+            )
             continue
     return InsightsListResponse(insights=recs, total_returned=len(recs))
 
@@ -359,9 +365,7 @@ def _chat_completion_sync(body: ChatCompletionRequest, settings: Settings) -> di
             "messages": [{"role": "user", "content": text}],
             "stream": False,
         }
-        if overrides:
-            for k, v in overrides.items():
-                payload[k] = v
+        merge_ollama_chat_options(payload, overrides)
         with httpx.Client(timeout=settings.ollama_timeout_seconds) as client:
             r = client.post(
                 f"{settings.ollama_base_url.rstrip('/')}/api/chat",

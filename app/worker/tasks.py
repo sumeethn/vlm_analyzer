@@ -4,6 +4,7 @@ import logging
 import shutil
 import time
 from pathlib import Path
+from typing import Any
 
 try:
     import cv2
@@ -120,7 +121,7 @@ def process_video_job(job_id: str) -> None:
                 for ci, mp4_path in enumerate(mp4_paths):
                     frame_dir = src_dir / f"chunk_{ci:06d}_frames"
                     jpgs = extract_spaced_jpegs_from_mp4(
-                        Path(mp4_path),
+                        mp4_path,
                         out_dir=frame_dir,
                         stem="f",
                         n=frames_per_chunk,
@@ -184,8 +185,13 @@ def process_video_job(job_id: str) -> None:
             shutil.rmtree(work_root, ignore_errors=True)
 
 
-def _finalize_stream_stopped(stream_store: StreamStore, stream_id: str) -> None:
-    s = stream_store.get(stream_id)
+def _finalize_stream_stopped(
+    stream_store: StreamStore,
+    stream_id: str,
+    *,
+    stream: dict[str, Any] | None = None,
+) -> None:
+    s = stream if stream is not None else stream_store.get(stream_id)
     if s:
         s["status"] = "stopped"
         stream_store.save(s)
@@ -218,7 +224,7 @@ def process_rtsp_stream(stream_id: str) -> None:
                 return
 
             if s["status"] == "stopping":
-                _finalize_stream_stopped(stream_store, stream_id)
+                _finalize_stream_stopped(stream_store, stream_id, stream=s)
                 return
 
             if s["status"] != "active":
@@ -239,84 +245,121 @@ def process_rtsp_stream(stream_id: str) -> None:
                 shutil.rmtree(iter_dir, ignore_errors=True)
             iter_dir.mkdir(parents=True, exist_ok=True)
 
-            try:
-                if chunk_format == "jpg":
-                    frame_paths = segment_to_jpg(
-                        uri=uri,
-                        kind="rtsp",
-                        out_dir=iter_dir,
-                        chunk_seconds=chunk_seconds,
-                        use_nvdec=use_nvdec,
-                        frames_per_chunk=frames_per_chunk,
-                        max_chunks=1,
-                    )
-                else:
-                    chunk_paths = segment_to_mp4(
-                        uri=uri,
-                        kind="rtsp",
-                        out_dir=iter_dir,
-                        chunk_seconds=chunk_seconds,
-                        use_nvdec=use_nvdec,
-                        max_chunks=1,
-                    )
-            except Exception as e:
-                logger.exception("stream %s ffmpeg failed", stream_id)
-                s["status"] = "failed"
-                s["last_error"] = str(e)
-                stream_store.save(s)
+            frame_paths: list[Path] = []
+            chunk_paths: list[Path] = []
+            ffmpeg_exc: Exception | None = None
+            for attempt in range(3):
+                try:
+                    if chunk_format == "jpg":
+                        frame_paths = segment_to_jpg(
+                            uri=uri,
+                            kind="rtsp",
+                            out_dir=iter_dir,
+                            chunk_seconds=chunk_seconds,
+                            use_nvdec=use_nvdec,
+                            frames_per_chunk=frames_per_chunk,
+                            max_chunks=1,
+                        )
+                    else:
+                        chunk_paths = segment_to_mp4(
+                            uri=uri,
+                            kind="rtsp",
+                            out_dir=iter_dir,
+                            chunk_seconds=chunk_seconds,
+                            use_nvdec=use_nvdec,
+                            max_chunks=1,
+                        )
+                    ffmpeg_exc = None
+                    break
+                except Exception as e:
+                    ffmpeg_exc = e
+                    if attempt < 2:
+                        delay = 1.0 * (2**attempt)
+                        logger.warning(
+                            "stream %s ffmpeg attempt %s failed, retrying in %ss: %s",
+                            stream_id,
+                            attempt + 1,
+                            delay,
+                            e,
+                        )
+                        time.sleep(delay)
+
+            if ffmpeg_exc is not None:
+                logger.exception("stream %s ffmpeg failed after retries", stream_id)
+                cur = stream_store.get(stream_id)
+                if cur:
+                    cur["status"] = "failed"
+                    cur["last_error"] = str(ffmpeg_exc)
+                    stream_store.save(cur)
                 stream_store.remove_from_active(stream_id)
+                shutil.rmtree(iter_dir, ignore_errors=True)
                 return
 
+            skip_vlm = False
+            frame_group: list[Path] = []
             if chunk_format == "jpg":
                 if len(frame_paths) < frames_per_chunk:
-                    err = (
-                        f"expected {frames_per_chunk} frame(s) from RTSP in this window, "
-                        f"got {len(frame_paths)}"
+                    logger.warning(
+                        "stream %s seq=%s: got %s jpg frame(s), need %s; "
+                        "skipping VLM for this window",
+                        stream_id,
+                        seq,
+                        len(frame_paths),
+                        frames_per_chunk,
                     )
-                    logger.error("stream %s: %s", stream_id, err)
-                    s["status"] = "failed"
-                    s["last_error"] = err
-                    stream_store.save(s)
-                    stream_store.remove_from_active(stream_id)
-                    return
-                frame_group = frame_paths[:frames_per_chunk]
+                    skip_vlm = True
+                else:
+                    frame_group = frame_paths[:frames_per_chunk]
+            elif not chunk_paths:
+                logger.warning(
+                    "stream %s seq=%s: no mp4 captured; skipping VLM for this window",
+                    stream_id,
+                    seq,
+                )
+                skip_vlm = True
             else:
-                if not chunk_paths:
-                    err = "no media captured from RTSP in this window"
-                    logger.error("stream %s: %s", stream_id, err)
-                    s["status"] = "failed"
-                    s["last_error"] = err
-                    stream_store.save(s)
-                    stream_store.remove_from_active(stream_id)
-                    return
-                frame_group = extract_spaced_jpegs_from_mp4(
-                    Path(chunk_paths[0]),
-                    out_dir=iter_dir / "vlm_frames",
-                    stem="f",
-                    n=frames_per_chunk,
-                    use_nvdec=use_nvdec,
-                )
+                try:
+                    frame_group = extract_spaced_jpegs_from_mp4(
+                        chunk_paths[0],
+                        out_dir=iter_dir / "vlm_frames",
+                        stem="f",
+                        n=frames_per_chunk,
+                        use_nvdec=use_nvdec,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "stream %s seq=%s: frame extract failed: %s",
+                        stream_id,
+                        seq,
+                        e,
+                        exc_info=True,
+                    )
+                    skip_vlm = True
 
+            completion: dict[str, Any] | None = None
             try:
-                images_b64 = [file_to_base64(Path(p)) for p in frame_group]
-                ollama_body = ollama_chat_vision(
-                    base_url=settings.ollama_base_url,
-                    model=model,
-                    prompt=prompt,
-                    images_b64=images_b64,
-                    timeout_seconds=settings.ollama_timeout_seconds,
-                    options=options,
-                )
-                completion = ollama_to_openai_chat_completion(
-                    ollama_body=ollama_body,
-                    model=model,
-                    completion_id_prefix="chatcmpl-stream",
-                )
+                if not skip_vlm:
+                    images_b64 = [file_to_base64(p) for p in frame_group]
+                    ollama_body = ollama_chat_vision(
+                        base_url=settings.ollama_base_url,
+                        model=model,
+                        prompt=prompt,
+                        images_b64=images_b64,
+                        timeout_seconds=settings.ollama_timeout_seconds,
+                        options=options,
+                    )
+                    completion = ollama_to_openai_chat_completion(
+                        ollama_body=ollama_body,
+                        model=model,
+                        completion_id_prefix="chatcmpl-stream",
+                    )
             except Exception as e:
                 logger.exception("stream %s VLM failed", stream_id)
-                s["status"] = "failed"
-                s["last_error"] = str(e)
-                stream_store.save(s)
+                cur = stream_store.get(stream_id)
+                if cur:
+                    cur["status"] = "failed"
+                    cur["last_error"] = str(e)
+                    stream_store.save(cur)
                 stream_store.remove_from_active(stream_id)
                 return
             finally:
@@ -326,7 +369,7 @@ def process_rtsp_stream(stream_id: str) -> None:
             if not s:
                 return
             if s["status"] == "stopping":
-                _finalize_stream_stopped(stream_store, stream_id)
+                _finalize_stream_stopped(stream_store, stream_id, stream=s)
                 return
 
             s["chunk_seq"] = seq + 1
@@ -334,13 +377,14 @@ def process_rtsp_stream(stream_id: str) -> None:
             s["last_error"] = None
             stream_store.save(s)
 
-            _append_insight(
-                job_id=None,
-                stream_id=stream_id,
-                source_index=0,
-                chunk_index=seq,
-                completion=completion,
-            )
+            if completion is not None:
+                _append_insight(
+                    job_id=None,
+                    stream_id=stream_id,
+                    source_index=0,
+                    chunk_index=seq,
+                    completion=completion,
+                )
 
     finally:
         if work_root.exists():

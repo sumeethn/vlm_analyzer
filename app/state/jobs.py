@@ -32,7 +32,19 @@ class JobStore:
 
     def save(self, data: dict[str, Any]) -> None:
         job_id = data["job_id"]
-        self._r.setex(self._key(job_id), self.ttl, json.dumps(data))
+        key = self._key(job_id)
+        blob = json.dumps(data)
+        if self._r.exists(key):
+            try:
+                self._r.set(key, blob, keepttl=True)
+            except redis.RedisError:
+                ttl = self._r.ttl(key)
+                if ttl is not None and ttl > 0:
+                    self._r.setex(key, ttl, blob)
+                else:
+                    self._r.setex(key, self.ttl, blob)
+        else:
+            self._r.setex(key, self.ttl, blob)
 
     def ping(self) -> bool:
         try:
