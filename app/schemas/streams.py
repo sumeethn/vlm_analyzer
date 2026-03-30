@@ -14,6 +14,10 @@ class CreateStreamRequest(BaseModel):
         default="Describe what you see in this video segment.",
         min_length=1,
     )
+    frames_per_chunk: int | None = Field(
+        default=None,
+        description="Override server default; samples this many frames per chunk window for the VLM.",
+    )
     ollama_options: dict[str, Any] | None = None
 
 
@@ -38,6 +42,7 @@ class StreamDetailResponse(BaseModel):
     prompt: str
     chunk_seconds: float
     chunk_format: str
+    frames_per_chunk: int
     chunk_seq: int
     last_chunk_at: float | None
     created_at: float

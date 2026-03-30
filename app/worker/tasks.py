@@ -12,7 +12,7 @@ except ImportError:  # pragma: no cover
 
 from app.config import get_settings
 from app.services.chunker import (
-    extract_representative_jpeg,
+    extract_spaced_jpegs_from_mp4,
     segment_to_jpg,
     segment_to_mp4,
 )
@@ -81,6 +81,7 @@ def process_video_job(job_id: str) -> None:
         model = job["model"]
         prompt = job["prompt"]
         options = job.get("ollama_options") or {}
+        frames_per_chunk = int(job.get("frames_per_chunk") or 1)
 
         for si, source in enumerate(sources):
             kind = source["kind"]
@@ -91,16 +92,23 @@ def process_video_job(job_id: str) -> None:
 
             src_dir = work_root / str(si)
             if chunk_format == "jpg":
-                chunk_paths = segment_to_jpg(
+                frame_paths = segment_to_jpg(
                     uri=uri,
                     kind=kind,
                     out_dir=src_dir,
                     chunk_seconds=chunk_seconds,
                     use_nvdec=use_nvdec,
+                    frames_per_chunk=frames_per_chunk,
                     max_chunks=max_chunks,
                 )
+                groups: list[list[Path]] = []
+                for i in range(0, len(frame_paths), frames_per_chunk):
+                    g = frame_paths[i : i + frames_per_chunk]
+                    if len(g) == frames_per_chunk:
+                        groups.append(g)
+                groups = groups[:max_chunks]
             else:
-                chunk_paths = segment_to_mp4(
+                mp4_paths = segment_to_mp4(
                     uri=uri,
                     kind=kind,
                     out_dir=src_dir,
@@ -108,30 +116,30 @@ def process_video_job(job_id: str) -> None:
                     use_nvdec=use_nvdec,
                     max_chunks=max_chunks,
                 )
+                groups = []
+                for ci, mp4_path in enumerate(mp4_paths):
+                    frame_dir = src_dir / f"chunk_{ci:06d}_frames"
+                    jpgs = extract_spaced_jpegs_from_mp4(
+                        Path(mp4_path),
+                        out_dir=frame_dir,
+                        stem="f",
+                        n=frames_per_chunk,
+                        use_nvdec=use_nvdec,
+                    )
+                    groups.append(jpgs)
 
-            chunk_paths = chunk_paths[:max_chunks]
-            chunks_total += len(chunk_paths)
+            chunks_total += len(groups)
             job["chunks_total"] = chunks_total
             job["chunks_done"] = chunks_done
             store.save(job)
 
-            for ci, chunk_path in enumerate(chunk_paths):
-                if chunk_format == "jpg":
-                    image_path = chunk_path
-                else:
-                    image_path = chunk_path.with_suffix(".vlm.jpg")
-                    extract_representative_jpeg(
-                        Path(chunk_path),
-                        Path(image_path),
-                        use_nvdec=use_nvdec,
-                    )
-
-                image_b64 = file_to_base64(Path(image_path))
+            for ci, frame_group in enumerate(groups):
+                images_b64 = [file_to_base64(p) for p in frame_group]
                 ollama_body = ollama_chat_vision(
                     base_url=settings.ollama_base_url,
                     model=model,
                     prompt=prompt,
-                    image_b64=image_b64,
+                    images_b64=images_b64,
                     timeout_seconds=settings.ollama_timeout_seconds,
                     options=options,
                 )
@@ -143,7 +151,8 @@ def process_video_job(job_id: str) -> None:
                 entry = {
                     "source_index": si,
                     "chunk_index": ci,
-                    "artifact_path": str(chunk_path),
+                    "artifact_path": str(frame_group[0]),
+                    "artifact_paths": [str(p) for p in frame_group],
                     "completion": completion,
                 }
                 results.append(entry)
@@ -222,6 +231,7 @@ def process_rtsp_stream(stream_id: str) -> None:
             prompt = s["prompt"]
             options = s.get("ollama_options") or {}
             use_nvdec = settings.enable_nvdec
+            frames_per_chunk = int(s.get("frames_per_chunk") or 1)
             seq = int(s["chunk_seq"])
 
             iter_dir = work_root / f"iter_{seq}"
@@ -231,12 +241,13 @@ def process_rtsp_stream(stream_id: str) -> None:
 
             try:
                 if chunk_format == "jpg":
-                    chunk_paths = segment_to_jpg(
+                    frame_paths = segment_to_jpg(
                         uri=uri,
                         kind="rtsp",
                         out_dir=iter_dir,
                         chunk_seconds=chunk_seconds,
                         use_nvdec=use_nvdec,
+                        frames_per_chunk=frames_per_chunk,
                         max_chunks=1,
                     )
                 else:
@@ -256,33 +267,43 @@ def process_rtsp_stream(stream_id: str) -> None:
                 stream_store.remove_from_active(stream_id)
                 return
 
-            if not chunk_paths:
-                err = "no media captured from RTSP in this window"
-                logger.error("stream %s: %s", stream_id, err)
-                s["status"] = "failed"
-                s["last_error"] = err
-                stream_store.save(s)
-                stream_store.remove_from_active(stream_id)
-                return
-
-            chunk_path = chunk_paths[0]
             if chunk_format == "jpg":
-                image_path = chunk_path
+                if len(frame_paths) < frames_per_chunk:
+                    err = (
+                        f"expected {frames_per_chunk} frame(s) from RTSP in this window, "
+                        f"got {len(frame_paths)}"
+                    )
+                    logger.error("stream %s: %s", stream_id, err)
+                    s["status"] = "failed"
+                    s["last_error"] = err
+                    stream_store.save(s)
+                    stream_store.remove_from_active(stream_id)
+                    return
+                frame_group = frame_paths[:frames_per_chunk]
             else:
-                image_path = chunk_path.with_suffix(".vlm.jpg")
-                extract_representative_jpeg(
-                    Path(chunk_path),
-                    Path(image_path),
+                if not chunk_paths:
+                    err = "no media captured from RTSP in this window"
+                    logger.error("stream %s: %s", stream_id, err)
+                    s["status"] = "failed"
+                    s["last_error"] = err
+                    stream_store.save(s)
+                    stream_store.remove_from_active(stream_id)
+                    return
+                frame_group = extract_spaced_jpegs_from_mp4(
+                    Path(chunk_paths[0]),
+                    out_dir=iter_dir / "vlm_frames",
+                    stem="f",
+                    n=frames_per_chunk,
                     use_nvdec=use_nvdec,
                 )
 
             try:
-                image_b64 = file_to_base64(Path(image_path))
+                images_b64 = [file_to_base64(Path(p)) for p in frame_group]
                 ollama_body = ollama_chat_vision(
                     base_url=settings.ollama_base_url,
                     model=model,
                     prompt=prompt,
-                    image_b64=image_b64,
+                    images_b64=images_b64,
                     timeout_seconds=settings.ollama_timeout_seconds,
                     options=options,
                 )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 import subprocess
 import threading
 from pathlib import Path
@@ -115,8 +116,8 @@ def build_input_args(uri: str, kind: str, *, use_nvdec: bool) -> list[str]:
     return opts
 
 
-def _jpg_vf_fps(chunk_seconds: float, *, use_nvdec: bool) -> str:
-    fps = 1.0 / max(chunk_seconds, 0.5)
+def _jpg_vf_fps(chunk_seconds: float, frames_per_chunk: int, *, use_nvdec: bool) -> str:
+    fps = frames_per_chunk / max(chunk_seconds, 0.5)
     if use_nvdec and detect_cuda_hwaccel_available():
         return f"hwdownload,format=nv12,fps={fps}"
     return f"fps={fps}"
@@ -129,14 +130,15 @@ def segment_to_jpg(
     out_dir: Path,
     chunk_seconds: float,
     use_nvdec: bool,
+    frames_per_chunk: int = 1,
     max_chunks: int | None = None,
 ) -> list[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     pattern = str(out_dir / "chunk_%06d.jpg")
-    vf = _jpg_vf_fps(chunk_seconds, use_nvdec=use_nvdec)
+    vf = _jpg_vf_fps(chunk_seconds, frames_per_chunk, use_nvdec=use_nvdec)
     frame_cap: list[str] = []
     if max_chunks is not None:
-        frame_cap = ["-frames:v", str(max_chunks)]
+        frame_cap = ["-frames:v", str(max_chunks * frames_per_chunk)]
     attempts: list[list[str]] = []
     if use_nvdec and nvdec_input_prefix(use_nvdec=True):
         inp = build_input_args(uri, kind, use_nvdec=True)
@@ -157,7 +159,7 @@ def segment_to_jpg(
             *build_input_args(uri, kind, use_nvdec=False),
             "-an",
             "-vf",
-            f"fps={1.0 / max(chunk_seconds, 0.5)}",
+            f"fps={frames_per_chunk / max(chunk_seconds, 0.5)}",
             *frame_cap,
             "-q:v",
             "3",
@@ -166,6 +168,63 @@ def segment_to_jpg(
     )
     _run_ffmpeg_attempts(attempts)
     return sorted(out_dir.glob("chunk_*.jpg"))
+
+
+def extract_spaced_jpegs_from_mp4(
+    mp4_path: Path,
+    *,
+    out_dir: Path,
+    stem: str,
+    n: int,
+    use_nvdec: bool,
+) -> list[Path]:
+    """Extract n JPEGs evenly spaced over the file's timeline (same rule as fps=n/duration)."""
+    if n < 1:
+        raise ValueError("n must be >= 1")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pattern = str(out_dir / f"{stem}_%03d.jpg")
+    duration = probe_duration_seconds(str(mp4_path)) or 1.0
+    fps = n / max(duration, 0.01)
+    vf_soft = f"fps={fps}"
+    attempts: list[list[str]] = []
+    if use_nvdec and nvdec_input_prefix(use_nvdec=True):
+        vf_hw = f"hwdownload,format=nv12,fps={fps}"
+        attempts.append(
+            [
+                *nvdec_input_prefix(use_nvdec=True),
+                "-i",
+                str(mp4_path),
+                "-an",
+                "-vf",
+                vf_hw,
+                "-frames:v",
+                str(n),
+                "-q:v",
+                "3",
+                pattern,
+            ]
+        )
+    attempts.append(
+        [
+            "-i",
+            str(mp4_path),
+            "-an",
+            "-vf",
+            vf_soft,
+            "-frames:v",
+            str(n),
+            "-q:v",
+            "3",
+            pattern,
+        ]
+    )
+    _run_ffmpeg_attempts(attempts)
+    paths = sorted(out_dir.glob(f"{stem}_*.jpg"))
+    if len(paths) < n:
+        raise RuntimeError(
+            f"expected {n} jpeg(s) from {mp4_path.name}, got {len(paths)}"
+        )
+    return paths[:n]
 
 
 def segment_to_mp4(
@@ -250,35 +309,13 @@ def extract_representative_jpeg(
     *,
     use_nvdec: bool,
 ) -> None:
-    duration = probe_duration_seconds(str(mp4_path)) or 1.0
-    ss = max(duration / 2 - 0.25, 0.0)
-    attempts: list[list[str]] = []
-    if use_nvdec and nvdec_input_prefix(use_nvdec=True):
-        attempts.append(
-            [
-                *nvdec_input_prefix(use_nvdec=True),
-                "-ss",
-                str(ss),
-                "-i",
-                str(mp4_path),
-                "-frames:v",
-                "1",
-                "-q:v",
-                "3",
-                str(out_jpg),
-            ]
-        )
-    attempts.append(
-        [
-            "-ss",
-            str(ss),
-            "-i",
-            str(mp4_path),
-            "-frames:v",
-            "1",
-            "-q:v",
-            "3",
-            str(out_jpg),
-        ]
+    out_jpg.parent.mkdir(parents=True, exist_ok=True)
+    tmp_stem = f"{out_jpg.stem}_one"
+    paths = extract_spaced_jpegs_from_mp4(
+        mp4_path,
+        out_dir=out_jpg.parent,
+        stem=tmp_stem,
+        n=1,
+        use_nvdec=use_nvdec,
     )
-    _run_ffmpeg_attempts(attempts)
+    shutil.move(str(paths[0]), str(out_jpg))
