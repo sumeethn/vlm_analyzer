@@ -33,6 +33,10 @@ class StartProcessingRequest(BaseModel):
         min_length=1,
     )
     max_chunks_per_source: int = Field(200, ge=1, le=10_000)
+    frames_per_chunk: int | None = Field(
+        default=None,
+        description="Override server default; samples this many frames per chunk window for the VLM.",
+    )
     ollama_options: dict[str, Any] | None = None
 
 
@@ -54,6 +58,7 @@ class JobDetailResponse(BaseModel):
     prompt: str
     chunk_seconds: float
     chunk_format: str
+    frames_per_chunk: int
     sources: list[MediaSource]
     chunks_total: int
     chunks_done: int

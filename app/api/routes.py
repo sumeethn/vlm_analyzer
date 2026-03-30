@@ -42,6 +42,19 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _resolve_frames_per_chunk(requested: int | None, settings: Settings) -> int:
+    fpc = settings.frames_per_chunk if requested is None else requested
+    if fpc < 1 or fpc > settings.max_frames_per_chunk:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "frames_per_chunk must be between 1 and "
+                f"{settings.max_frames_per_chunk} (inclusive)"
+            ),
+        )
+    return fpc
+
+
 @router.get("/v1/health")
 async def health(settings: Settings = Depends(get_settings)) -> dict:
     store = JobStore(settings)
@@ -82,6 +95,7 @@ async def create_job(
                 ),
             )
 
+    fpc = _resolve_frames_per_chunk(body.frames_per_chunk, settings)
     store = JobStore(settings)
     initial = {
         "status": JobStatus.queued.value,
@@ -89,6 +103,7 @@ async def create_job(
         "prompt": body.prompt,
         "chunk_seconds": body.chunk_seconds,
         "chunk_format": body.chunk_format,
+        "frames_per_chunk": fpc,
         "sources": [s.model_dump(mode="json") for s in body.sources],
         "ollama_options": body.ollama_options,
         "max_chunks_per_source": body.max_chunks_per_source,
@@ -116,6 +131,7 @@ async def get_job(job_id: str, settings: Settings = Depends(get_settings)) -> Jo
         prompt=data["prompt"],
         chunk_seconds=float(data["chunk_seconds"]),
         chunk_format=data["chunk_format"],
+        frames_per_chunk=int(data.get("frames_per_chunk", 1)),
         sources=[MediaSource.model_validate(s) for s in data["sources"]],
         chunks_total=int(data.get("chunks_total", 0)),
         chunks_done=int(data.get("chunks_done", 0)),
@@ -169,6 +185,7 @@ async def register_stream(
             detail="rtsp_url must start with rtsp://",
         )
     _chunk_bounds(settings, body.chunk_seconds)
+    fpc = _resolve_frames_per_chunk(body.frames_per_chunk, settings)
 
     stream_store = StreamStore(settings)
     stream_id = stream_store.create_stream(
@@ -179,6 +196,7 @@ async def register_stream(
             "prompt": body.prompt,
             "chunk_seconds": body.chunk_seconds,
             "chunk_format": body.chunk_format,
+            "frames_per_chunk": fpc,
             "ollama_options": body.ollama_options,
         }
     )
@@ -228,6 +246,7 @@ async def get_stream(
         prompt=s["prompt"],
         chunk_seconds=float(s["chunk_seconds"]),
         chunk_format=s["chunk_format"],
+        frames_per_chunk=int(s.get("frames_per_chunk", 1)),
         chunk_seq=int(s.get("chunk_seq", 0)),
         last_chunk_at=s.get("last_chunk_at"),
         created_at=float(s.get("created_at", 0)),
@@ -330,7 +349,7 @@ def _chat_completion_sync(body: ChatCompletionRequest, settings: Settings) -> di
             base_url=settings.ollama_base_url,
             model=body.model,
             prompt=text,
-            image_b64=image_b64,
+            images_b64=[image_b64],
             timeout_seconds=settings.ollama_timeout_seconds,
             options=overrides,
         )

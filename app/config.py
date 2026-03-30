@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     max_sources_per_job: int = 32
     ollama_timeout_seconds: float = 300.0
     enable_nvdec: bool = False
+    # Frames sampled per chunk window (evenly spaced in time); all are sent in one Ollama call.
+    frames_per_chunk: int = 1
+    max_frames_per_chunk: int = 32
 
     stream_key_prefix: str = "stream:"
     streams_active_set_key: str = "streams:active"

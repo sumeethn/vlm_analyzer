@@ -42,10 +42,12 @@ def ollama_chat_vision(
     base_url: str,
     model: str,
     prompt: str,
-    image_b64: str,
+    images_b64: list[str],
     timeout_seconds: float,
     options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if not images_b64:
+        raise ValueError("at least one image is required")
     base = base_url.rstrip("/")
     payload: dict[str, Any] = {
         "model": model,
@@ -53,7 +55,7 @@ def ollama_chat_vision(
             {
                 "role": "user",
                 "content": prompt,
-                "images": [image_b64],
+                "images": images_b64,
             }
         ],
         "stream": False,
