@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from typing import Any
+from typing import Any, cast
 
 import redis
 
@@ -40,6 +40,22 @@ class StreamStore:
         if not raw:
             return None
         return json.loads(raw)
+
+    def get_many(self, stream_ids: list[str]) -> list[dict[str, Any] | None]:
+        if not stream_ids:
+            return []
+        keys = [self._key(sid) for sid in stream_ids]
+        raw_vals = cast(
+            "list[str | None]",
+            self._r.mget(keys),
+        )
+        out: list[dict[str, Any] | None] = []
+        for raw in raw_vals:
+            if raw is None:
+                out.append(None)
+            else:
+                out.append(json.loads(raw))
+        return out
 
     def save(self, data: dict[str, Any]) -> None:
         data["updated_at"] = time.time()
