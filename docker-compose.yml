@@ -51,6 +51,18 @@ services:
       redis:
         condition: service_healthy
 
+  package_delivery_alert:
+    build:
+      context: skills/package_delivery_alert
+      dockerfile: Dockerfile
+    env_file:
+      - skills/package_delivery_alert/.env
+    environment:
+      VLM_BASE_URL: http://api:8000
+    restart: unless-stopped
+    depends_on:
+      - api
+
 volumes:
   redis_data:
   job_temp:
