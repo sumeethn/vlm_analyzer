@@ -38,18 +38,18 @@ class SkillConfig:
         default_factory=lambda: int(os.environ.get("FRAMES_PER_CHUNK", "3"))
     )
 
-    # --- Redis / OpenClaw event bus ---
+    # --- Redis / Nova event bus ---
     redis_url: str = field(
         default_factory=lambda: os.environ.get("REDIS_URL", "redis://localhost:6379/0")
     )
     insights_stream: str = field(
-        default_factory=lambda: os.environ.get("OPENCLAW_INSIGHTS_STREAM", "openclaw:insights")
+        default_factory=lambda: os.environ.get("NOVA_INSIGHTS_STREAM", "nova:insights")
     )
     alerts_stream: str = field(
-        default_factory=lambda: os.environ.get("OPENCLAW_ALERTS_STREAM", "openclaw:alerts")
+        default_factory=lambda: os.environ.get("NOVA_ALERTS_STREAM", "nova:alerts")
     )
     stream_maxlen: int = field(
-        default_factory=lambda: int(os.environ.get("OPENCLAW_STREAM_MAXLEN", "10000"))
+        default_factory=lambda: int(os.environ.get("NOVA_STREAM_MAXLEN", "10000"))
     )
 
     # --- detection ---

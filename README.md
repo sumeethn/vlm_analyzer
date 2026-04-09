@@ -1,8 +1,8 @@
-# OpenClaw — Home Automation Platform
+# Nova — Home Automation Platform
 
 ## Overview
 
-OpenClaw is a mono-repo for event-driven home automation built around a **vision-language model (VLM)** microservice. Cameras stream video to the VLM analyzer, which publishes analysis results to a **Redis Streams** message bus. Skills subscribe to the bus, detect events of interest, and publish alerts. Consumers deliver those alerts to notification channels (Discord, etc.).
+Nova is a mono-repo for event-driven home automation built around a **vision-language model (VLM)** microservice. Cameras stream video to the VLM analyzer, which publishes analysis results to a **Redis Streams** message bus. Skills subscribe to the bus, detect events of interest, and publish alerts. Consumers deliver those alerts to notification channels (Discord, etc.).
 
 ```
 [IP Cameras / RTSP Streams]
@@ -12,7 +12,7 @@ OpenClaw is a mono-repo for event-driven home automation built around a **vision
   Chunks video, runs VLM
          │
          ▼  xadd
-  Redis Stream: openclaw:insights
+  Redis Stream: nova:insights
          │
          │  xreadgroup (fan-out, one consumer group per skill)
    ┌─────┴──────────────────┐
@@ -21,7 +21,7 @@ OpenClaw is a mono-repo for event-driven home automation built around a **vision
    Detect → publish alert
          │
          ▼  xadd
-  Redis Stream: openclaw:alerts
+  Redis Stream: nova:alerts
          │
          ▼  xreadgroup
 [discord_notifier]        ...future consumers (Slack, SMS, Home Assistant)
@@ -35,7 +35,7 @@ OpenClaw is a mono-repo for event-driven home automation built around a **vision
 |------|------|
 | `app/` | **vlm_analyzer** FastAPI service (API, worker, state, services) |
 | `common/` | Shared SDK: `EventBus` class, event schema TypedDicts |
-| `skills/` | One directory per OpenClaw skill |
+| `skills/` | One directory per Nova skill |
 | `skills/package_delivery_alert/` | Detects package deliveries on a front-yard camera |
 | `consumers/` | One directory per notification consumer |
 | `consumers/discord_notifier/` | Forwards alerts from any skill to a Discord webhook |
@@ -50,7 +50,7 @@ OpenClaw is a mono-repo for event-driven home automation built around a **vision
 
 FastAPI microservice that processes video — live RTSP streams or local files — using a VLM via [Ollama](https://github.com/ollama/ollama). Celery workers handle async chunking and inference.
 
-When `OPENCLAW_BUS_ENABLED=true` the worker publishes every VLM completion to the `openclaw:insights` Redis Stream immediately after storing it. This is opt-in so the service can run standalone without OpenClaw.
+When `NOVA_BUS_ENABLED=true` the worker publishes every VLM completion to the `nova:insights` Redis Stream immediately after storing it. This is opt-in so the service can run standalone without Nova.
 
 **Key API routes**
 
@@ -78,9 +78,9 @@ Shared Python package used by all skills and consumers.
 
 Each skill:
 1. Registers its camera(s) with vlm_analyzer on startup via `POST /v1/streams`.
-2. Subscribes to `openclaw:insights` as a dedicated consumer group.
+2. Subscribes to `nova:insights` as a dedicated consumer group.
 3. Filters insights by its own `stream_id`, runs detection logic.
-4. Publishes an `AlertEvent` to `openclaw:alerts` when an event is detected.
+4. Publishes an `AlertEvent` to `nova:alerts` when an event is detected.
 5. Deregisters its streams on shutdown.
 
 **Available skills**
@@ -91,7 +91,7 @@ Each skill:
 
 ### Consumers (`consumers/`)
 
-Consumers subscribe to `openclaw:alerts` and forward alerts to external channels. They are decoupled from detection — swapping Discord for another channel requires only a new consumer, not changes to any skill.
+Consumers subscribe to `nova:alerts` and forward alerts to external channels. They are decoupled from detection — swapping Discord for another channel requires only a new consumer, not changes to any skill.
 
 **Available consumers**
 
@@ -105,8 +105,8 @@ Consumers subscribe to `openclaw:alerts` and forward alerts to external channels
 
 | Stream | Producer | Consumer(s) | Content |
 |--------|----------|-------------|---------|
-| `openclaw:insights` | vlm_analyzer worker | Skills (one consumer group each) | VLM completion for every processed video chunk |
-| `openclaw:alerts` | Skills | Consumers (one consumer group each) | Detected event with score, matched signals, and VLM excerpt |
+| `nova:insights` | vlm_analyzer worker | Skills (one consumer group each) | VLM completion for every processed video chunk |
+| `nova:alerts` | Skills | Consumers (one consumer group each) | Detected event with score, matched signals, and VLM excerpt |
 
 ---
 
@@ -164,10 +164,10 @@ curl -sS http://localhost:8000/v1/health
 curl -sS http://localhost:8000/v1/streams
 
 # Recent insights from the bus
-redis-cli XLEN openclaw:insights
+redis-cli XLEN nova:insights
 
 # Recent alerts
-redis-cli XLEN openclaw:alerts
+redis-cli XLEN nova:alerts
 ```
 
 ---
@@ -181,10 +181,10 @@ redis-cli XLEN openclaw:alerts
 | `REDIS_URL` | Redis for job/stream/insight state | `redis://localhost:6379/0` |
 | `CELERY_BROKER_URL` | Celery broker | `redis://redis:6379/1` |
 | `OLLAMA_BASE_URL` | Ollama HTTP base | `http://127.0.0.1:11434` |
-| `OPENCLAW_BUS_ENABLED` | Publish insights to Redis Streams | `false` |
-| `OPENCLAW_INSIGHTS_STREAM` | Stream key for VLM completions | `openclaw:insights` |
-| `OPENCLAW_ALERTS_STREAM` | Stream key for detected alerts | `openclaw:alerts` |
-| `OPENCLAW_STREAM_MAXLEN` | Maximum entries kept per stream | `10000` |
+| `NOVA_BUS_ENABLED` | Publish insights to Redis Streams | `false` |
+| `NOVA_INSIGHTS_STREAM` | Stream key for VLM completions | `nova:insights` |
+| `NOVA_ALERTS_STREAM` | Stream key for detected alerts | `nova:alerts` |
+| `NOVA_STREAM_MAXLEN` | Maximum entries kept per stream | `10000` |
 | `TEMP_DIR` | Temp workspace for video chunks | `/tmp/vlm_jobs` |
 | `VIDEO_MOUNT` | Root for validated file sources | `/data/videos` |
 | `ENABLE_NVDEC` | NVIDIA hardware decode | `false` |
@@ -227,7 +227,7 @@ redis-cli XLEN openclaw:alerts
 
 3. Start a Celery worker:
    ```bash
-   OPENCLAW_BUS_ENABLED=true celery -A app.worker.celery_app worker --loglevel=info
+   NOVA_BUS_ENABLED=true celery -A app.worker.celery_app worker --loglevel=info
    ```
 
 4. Run a skill (from repo root so `common/` is on the path):
@@ -249,9 +249,9 @@ redis-cli XLEN openclaw:alerts
 1. Create `skills/<skill_name>/` with `skill.py`, `detector.py`, `config.py`, `.env.example`, `Dockerfile`.
 2. In `skill.py`:
    - Register camera(s) with vlm_analyzer via `POST /v1/streams`.
-   - Use `EventBus.ensure_consumer_group("openclaw:insights", "<skill_name>")`.
+   - Use `EventBus.ensure_consumer_group("nova:insights", "<skill_name>")`.
    - Loop on `EventBus.consume(...)`, filter by `stream_id`, run detection.
-   - On detection call `EventBus.publish("openclaw:alerts", AlertEvent(...))`.
+   - On detection call `EventBus.publish("nova:alerts", AlertEvent(...))`.
 3. Add `AlertEvent` field `"skill": "<skill_name>"` so consumers can label it.
 4. Add the service to `docker-compose.yml` with build context set to the repo root.
 5. Add a row to the skills table in this README.
