@@ -1,8 +1,8 @@
-# OpenClaw — Home Automation Platform
+# Nova — Home Automation Platform
 
 ## Overview
 
-OpenClaw is a mono-repo for event-driven home automation built around a **vision-language model (VLM)** microservice. Cameras stream video to the VLM analyzer, which publishes analysis results to a **Redis Streams** message bus. Skills subscribe to the bus, detect events of interest, and publish alerts. Consumers deliver those alerts to notification channels (Discord, etc.).
+Nova is a event-driven home automation built around a **vision-language model (VLM)** microservice. Cameras stream video to the VLM analyzer, which publishes analysis results to a **Redis Streams** message bus. Skills subscribe to the bus, detect events of interest, and publish alerts. Consumers deliver those alerts to notification channels (Discord, etc.).
 
 ```
 [IP Cameras / RTSP Streams]
