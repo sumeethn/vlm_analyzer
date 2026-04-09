@@ -1,20 +1,20 @@
 """
-Shared Redis Streams helpers for Nova skills and consumers.
+Shared Redis Streams helpers for OpenClaw skills and consumers.
 
 Usage pattern for a skill
 -------------------------
     from common.event_bus import EventBus
 
     bus = EventBus(redis_url="redis://localhost:6379/0")
-    bus.ensure_consumer_group("nova:insights", "my_skill")
+    bus.ensure_consumer_group("openclaw:insights", "my_skill")
 
-    for msg_id, fields in bus.consume("nova:insights", "my_skill", "worker-1"):
+    for msg_id, fields in bus.consume("openclaw:insights", "my_skill", "worker-1"):
         process(fields)
-        bus.ack("nova:insights", "my_skill", msg_id)
+        bus.ack("openclaw:insights", "my_skill", msg_id)
 
 Usage pattern for publishing an alert
 --------------------------------------
-    bus.publish("nova:alerts", {"skill": "my_skill", ...})
+    bus.publish("openclaw:alerts", {"skill": "my_skill", ...})
 """
 from __future__ import annotations
 

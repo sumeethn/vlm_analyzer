@@ -1,5 +1,5 @@
 """
-Shared event schemas for the Nova message bus.
+Shared event schemas for the OpenClaw message bus.
 
 All values in Redis Stream entries are strings; these TypedDicts document
 the expected fields so skills and consumers can reference them by name.
@@ -11,7 +11,7 @@ from typing import TypedDict
 
 class InsightEvent(TypedDict):
     """
-    Published to  nova:insights  by vlm_analyzer after each VLM completion.
+    Published to  openclaw:insights  by vlm_analyzer after each VLM completion.
 
     Fields
     ------
@@ -39,7 +39,7 @@ class InsightEvent(TypedDict):
 
 class AlertEvent(TypedDict):
     """
-    Published to  nova:alerts  by a skill when it detects an event.
+    Published to  openclaw:alerts  by a skill when it detects an event.
 
     Fields
     ------

@@ -1,7 +1,7 @@
 """
-Publish insight events to the Nova Redis Stream.
+Publish insight events to the OpenClaw Redis Stream.
 
-Only active when NOVA_BUS_ENABLED=true.  Failures are logged and
+Only active when OPENCLAW_BUS_ENABLED=true.  Failures are logged and
 swallowed so a bus outage never disrupts normal vlm_analyzer operation.
 """
 from __future__ import annotations
@@ -18,14 +18,14 @@ logger = logging.getLogger(__name__)
 
 def publish_insight(settings: Settings, record: dict) -> None:
     """
-    Publish an InsightRecord to the nova:insights Redis Stream.
+    Publish an InsightRecord to the openclaw:insights Redis Stream.
 
     Parameters
     ----------
-    settings:   Application settings (checked for nova_bus_enabled).
+    settings:   Application settings (checked for openclaw_bus_enabled).
     record:     The dict returned by InsightStore.append().
     """
-    if not settings.nova_bus_enabled:
+    if not settings.openclaw_bus_enabled:
         return
 
     try:
@@ -37,7 +37,7 @@ def publish_insight(settings: Settings, record: dict) -> None:
 
         r = redis_lib.from_url(settings.redis_url, decode_responses=True)
         r.xadd(
-            settings.nova_insights_stream,
+            settings.openclaw_insights_stream,
             {
                 "insight_id": record.get("insight_id", ""),
                 "ts": str(record.get("ts", "")),
@@ -49,13 +49,13 @@ def publish_insight(settings: Settings, record: dict) -> None:
                 "content": content,
                 "completion_json": json.dumps(record.get("completion", {})),
             },
-            maxlen=settings.nova_stream_maxlen,
+            maxlen=settings.openclaw_stream_maxlen,
             approximate=True,
         )
         logger.debug(
             "Published insight %s to %s",
             record.get("insight_id"),
-            settings.nova_insights_stream,
+            settings.openclaw_insights_stream,
         )
     except Exception:
-        logger.warning("Failed to publish insight to Nova bus", exc_info=True)
+        logger.warning("Failed to publish insight to OpenClaw bus", exc_info=True)

@@ -1,7 +1,7 @@
 """
-discord_notifier — Nova consumer
+discord_notifier — OpenClaw consumer
 
-Subscribes to the  nova:alerts  Redis Stream and posts a Discord embed
+Subscribes to the  openclaw:alerts  Redis Stream and posts a Discord embed
 for every alert event, regardless of which skill produced it.
 
 Decoupling notifications from detection means:
@@ -45,7 +45,7 @@ _SKILL_LABELS: dict[str, str] = {
     "vehicle_exit_monitor": "🚗 Vehicle Exiting Premises",
     "license_plate_gate": "🔍 License Plate Recognised at Gate",
 }
-_DEFAULT_LABEL = "🔔 Nova Alert"
+_DEFAULT_LABEL = "🔔 OpenClaw Alert"
 
 _SKILL_COLORS: dict[str, int] = {
     "package_delivery_alert": 0xF4A015,   # amber
@@ -104,7 +104,7 @@ def _post_discord(webhook_url: str, mention: str, fields: dict[str, str]) -> boo
                 {"name": "Stream",   "value": fields.get("stream_id", "?"),   "inline": True},
                 {"name": "Chunk",    "value": fields.get("chunk_index", "?"), "inline": True},
             ],
-            "footer": {"text": "Nova · discord_notifier"},
+            "footer": {"text": "OpenClaw · discord_notifier"},
             "timestamp": _iso_utc(int(time.time())),
         }]
     }
@@ -191,10 +191,10 @@ if __name__ == "__main__":
     _load_dotenv()
     try:
         redis_url         = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
-        alerts_stream     = os.environ.get("NOVA_ALERTS_STREAM", "nova:alerts")
+        alerts_stream     = os.environ.get("OPENCLAW_ALERTS_STREAM", "openclaw:alerts")
         discord_webhook   = _require("DISCORD_WEBHOOK_URL")
         discord_mention   = os.environ.get("DISCORD_MENTION", "")
-        stream_maxlen     = int(os.environ.get("NOVA_STREAM_MAXLEN", "10000"))
+        stream_maxlen     = int(os.environ.get("OPENCLAW_STREAM_MAXLEN", "10000"))
     except KeyError as exc:
         logger.error("Missing required environment variable: %s", exc)
         sys.exit(1)

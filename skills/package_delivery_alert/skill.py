@@ -1,10 +1,10 @@
 """
-package_delivery_alert — Nova skill
+package_delivery_alert — OpenClaw skill
 
 Registers a front-yard camera RTSP stream with the vlm_analyzer microservice,
-then subscribes to the  nova:insights  Redis Stream.  When the VLM
+then subscribes to the  openclaw:insights  Redis Stream.  When the VLM
 response for this camera scores above the detection threshold the skill
-publishes an alert event to  nova:alerts  for any downstream consumer
+publishes an alert event to  openclaw:alerts  for any downstream consumer
 (e.g. discord_notifier) to handle.
 
 Usage
