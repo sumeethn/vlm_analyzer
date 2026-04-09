@@ -17,6 +17,7 @@ from app.services.chunker import (
     segment_to_jpg,
     segment_to_mp4,
 )
+from app.services.event_bus import publish_insight
 from app.services.openai_compat import ollama_to_openai_chat_completion
 from app.services.vlm import file_to_base64, ollama_chat_vision
 from app.state.insights import InsightStore
@@ -47,13 +48,14 @@ def _append_insight(
     completion: dict,
 ) -> None:
     settings = get_settings()
-    InsightStore(settings).append(
+    record = InsightStore(settings).append(
         stream_id=stream_id,
         job_id=job_id,
         source_index=source_index,
         chunk_index=chunk_index,
         completion=completion,
     )
+    publish_insight(settings, record)
 
 
 @celery_app.task(name="process_video_job")

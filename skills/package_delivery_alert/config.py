@@ -38,18 +38,18 @@ class SkillConfig:
         default_factory=lambda: int(os.environ.get("FRAMES_PER_CHUNK", "3"))
     )
 
-    # --- polling ---
-    poll_interval_seconds: float = field(
-        default_factory=lambda: float(os.environ.get("POLL_INTERVAL_SECONDS", "15"))
+    # --- Redis / OpenClaw event bus ---
+    redis_url: str = field(
+        default_factory=lambda: os.environ.get("REDIS_URL", "redis://localhost:6379/0")
     )
-
-    # --- Discord ---
-    discord_webhook_url: str = field(
-        default_factory=lambda: os.environ["DISCORD_WEBHOOK_URL"]  # required
+    insights_stream: str = field(
+        default_factory=lambda: os.environ.get("OPENCLAW_INSIGHTS_STREAM", "openclaw:insights")
     )
-    discord_mention: str = field(
-        # Optional: a Discord user/role mention string, e.g. "<@123456789>" or "@here"
-        default_factory=lambda: os.environ.get("DISCORD_MENTION", "")
+    alerts_stream: str = field(
+        default_factory=lambda: os.environ.get("OPENCLAW_ALERTS_STREAM", "openclaw:alerts")
+    )
+    stream_maxlen: int = field(
+        default_factory=lambda: int(os.environ.get("OPENCLAW_STREAM_MAXLEN", "10000"))
     )
 
     # --- detection ---
@@ -57,7 +57,7 @@ class SkillConfig:
     detection_threshold: int = field(
         default_factory=lambda: int(os.environ.get("DETECTION_THRESHOLD", "2"))
     )
-    # Seconds to suppress duplicate notifications after one fires.
+    # Seconds to suppress duplicate alert publishes after one fires.
     cooldown_seconds: float = field(
         default_factory=lambda: float(os.environ.get("COOLDOWN_SECONDS", "300"))
     )
