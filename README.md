@@ -1,147 +1,265 @@
-# Video VLM analyzer (microservice)
+# OpenClaw — Home Automation Platform
 
 ## Overview
 
-This repository contains a **FastAPI** microservice that processes video with a **vision-language model (VLM)** backed by **[Ollama](https://github.com/ollama/ollama)**. It supports:
+OpenClaw is a mono-repo for event-driven home automation built around a **vision-language model (VLM)** microservice. Cameras stream video to the VLM analyzer, which publishes analysis results to a **Redis Streams** message bus. Skills subscribe to the bus, detect events of interest, and publish alerts. Consumers deliver those alerts to notification channels (Discord, etc.).
 
-- **Batch jobs** over local video files (chunked, with per-chunk VLM completions).
-- **RTSP streams** registered for continuous chunked analysis.
-- **Insights** persisted in **Redis** and listed via HTTP.
-- An **OpenAI-compatible** `POST /v1/chat/completions` path for chat or single-image vision calls proxied to Ollama.
+```
+[IP Cameras / RTSP Streams]
+         │
+         ▼
+[vlm_analyzer service]          ← FastAPI + Celery + Ollama
+  Chunks video, runs VLM
+         │
+         ▼  xadd
+  Redis Stream: openclaw:insights
+         │
+         │  xreadgroup (fan-out, one consumer group per skill)
+   ┌─────┴──────────────────┐
+   ▼                        ▼
+[package_delivery_alert]  [vehicle_exit_monitor]  ...future skills
+   Detect → publish alert
+         │
+         ▼  xadd
+  Redis Stream: openclaw:alerts
+         │
+         ▼  xreadgroup
+[discord_notifier]        ...future consumers (Slack, SMS, Home Assistant)
+```
 
-Asynchronous work uses **Celery** workers with **Redis** as the broker and result backend.
+---
 
-## Status
+## Repository Layout
 
-Active development. APIs and behavior may change without a formal versioning policy beyond the FastAPI app version (`0.1.0` in `app/main.py`).
+| Path | Role |
+|------|------|
+| `app/` | **vlm_analyzer** FastAPI service (API, worker, state, services) |
+| `common/` | Shared SDK: `EventBus` class, event schema TypedDicts |
+| `skills/` | One directory per OpenClaw skill |
+| `skills/package_delivery_alert/` | Detects package deliveries on a front-yard camera |
+| `consumers/` | One directory per notification consumer |
+| `consumers/discord_notifier/` | Forwards alerts from any skill to a Discord webhook |
+| `Dockerfile` | Image for vlm_analyzer API + Celery worker |
+| `docker-compose.yml` | Full stack: Redis, vlm_analyzer, skills, consumers |
 
-## Contact
+---
 
-For questions, bugs, or requests, use your team’s usual issue tracker or chat channel for this repository. If none is published yet, open a discussion or issue in the hosting platform’s issue tracker and tag the maintainers you work with.
+## Services
 
-## Further documentation
+### vlm_analyzer (`app/`)
 
-- **Interactive API docs** (when the server is running): `http://localhost:8000/docs` (Swagger UI) and `http://localhost:8000/redoc`.
-- **FastAPI**: https://fastapi.tiangolo.com/
-- **Ollama API**: https://github.com/ollama/ollama/blob/main/docs/api.md
+FastAPI microservice that processes video — live RTSP streams or local files — using a VLM via [Ollama](https://github.com/ollama/ollama). Celery workers handle async chunking and inference.
 
-## Prerequisites
+When `OPENCLAW_BUS_ENABLED=true` the worker publishes every VLM completion to the `openclaw:insights` Redis Stream immediately after storing it. This is opt-in so the service can run standalone without OpenClaw.
 
-- **Docker** and **Docker Compose** (recommended), or Python **3.12+** with dependencies from `requirements.txt`.
-- **Ollama** running somewhere reachable from the API and worker (default: `http://127.0.0.1:11434`). The provided `docker-compose.yml` points at `http://host.docker.internal:11434` so the host’s Ollama is used from containers.
-- **Redis** for job/stream state and Celery (included in Compose).
+**Key API routes**
 
-## Quick start (Docker Compose)
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/v1/health` | Liveness and Redis connectivity |
+| POST | `/v1/jobs` | Queue a file-based video batch job |
+| GET | `/v1/jobs/{job_id}` | Job status and results |
+| POST | `/v1/streams` | Register an RTSP stream for continuous analysis |
+| GET | `/v1/streams` | List active streams |
+| GET | `/v1/streams/{stream_id}` | Stream detail |
+| DELETE | `/v1/streams/{stream_id}` | Stop a stream |
+| GET | `/v1/insights` | Paginated insight list (optional `stream_id` filter) |
+| GET | `/v1/streams/{stream_id}/insights` | Insights for one stream |
+| POST | `/v1/chat/completions` | OpenAI-compatible vision endpoint (proxied to Ollama) |
 
-From the repository root:
+### common/
+
+Shared Python package used by all skills and consumers.
+
+- **`event_bus.py`** — `EventBus` class wrapping Redis Streams (`xadd`, `xreadgroup`, `xack`, consumer group management).
+- **`events.py`** — `InsightEvent` and `AlertEvent` TypedDicts documenting the fields present in each stream entry.
+
+### Skills (`skills/`)
+
+Each skill:
+1. Registers its camera(s) with vlm_analyzer on startup via `POST /v1/streams`.
+2. Subscribes to `openclaw:insights` as a dedicated consumer group.
+3. Filters insights by its own `stream_id`, runs detection logic.
+4. Publishes an `AlertEvent` to `openclaw:alerts` when an event is detected.
+5. Deregisters its streams on shutdown.
+
+**Available skills**
+
+| Skill | Camera | Event detected |
+|-------|--------|----------------|
+| `package_delivery_alert` | Front yard / porch | Package left at the door |
+
+### Consumers (`consumers/`)
+
+Consumers subscribe to `openclaw:alerts` and forward alerts to external channels. They are decoupled from detection — swapping Discord for another channel requires only a new consumer, not changes to any skill.
+
+**Available consumers**
+
+| Consumer | Destination |
+|----------|-------------|
+| `discord_notifier` | Discord channel via incoming webhook |
+
+---
+
+## Message Bus Streams
+
+| Stream | Producer | Consumer(s) | Content |
+|--------|----------|-------------|---------|
+| `openclaw:insights` | vlm_analyzer worker | Skills (one consumer group each) | VLM completion for every processed video chunk |
+| `openclaw:alerts` | Skills | Consumers (one consumer group each) | Detected event with score, matched signals, and VLM excerpt |
+
+---
+
+## Quick Start (Docker Compose)
+
+### Prerequisites
+
+- Docker and Docker Compose
+- [Ollama](https://github.com/ollama/ollama) running on the host with at least one vision model pulled:
+  ```bash
+  ollama pull llava
+  ```
+
+### 1. Configure skills and consumers
+
+```bash
+cp skills/package_delivery_alert/.env.example skills/package_delivery_alert/.env
+cp consumers/discord_notifier/.env.example    consumers/discord_notifier/.env
+```
+
+Edit each `.env` file. Minimum required values:
+
+**`skills/package_delivery_alert/.env`**
+```
+RTSP_URL=rtsp://user:password@192.168.1.100:554/stream1
+```
+
+**`consumers/discord_notifier/.env`**
+```
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN
+```
+
+### 2. Start the stack
 
 ```bash
 docker compose up --build
 ```
 
-Services:
+Services started:
 
-- API: `http://localhost:8000`
-- Redis: `localhost:6379`
+| Service | Address |
+|---------|---------|
+| vlm_analyzer API | http://localhost:8000 |
+| Redis | localhost:6379 |
+| package_delivery_alert | (no port — event-driven) |
+| discord_notifier | (no port — event-driven) |
 
-The Compose file mounts `./samples` read-only at `/data/videos` inside the API and worker. Place test videos there or adjust the `VIDEO_MOUNT` / volume mapping.
-
-### Health check
+### 3. Verify
 
 ```bash
+# API health
 curl -sS http://localhost:8000/v1/health
+
+# Active streams (the skill registers one on startup)
+curl -sS http://localhost:8000/v1/streams
+
+# Recent insights from the bus
+redis-cli XLEN openclaw:insights
+
+# Recent alerts
+redis-cli XLEN openclaw:alerts
 ```
 
-You should see JSON with `status` and `redis`. If Redis is unreachable, `status` may be `degraded`.
+---
 
-### Example: start a file-based job
+## Configuration Reference
 
-Paths in `sources` must be **absolute paths inside the worker container** under `VIDEO_MOUNT` (default `/data/videos` in Docker). With the default Compose mount, a file `samples/clips/demo.mp4` on the host is `/data/videos/clips/demo.mp4` in the container.
-
-```bash
-curl -sS -X POST http://localhost:8000/v1/jobs \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "sources": [{"uri": "/data/videos/clips/demo.mp4", "kind": "file"}],
-    "model": "llava",
-    "chunk_seconds": 10,
-    "chunk_format": "jpg",
-    "prompt": "Describe what you see in this video segment."
-  }'
-```
-
-Poll job status (replace `JOB_ID` from the response):
-
-```bash
-curl -sS "http://localhost:8000/v1/jobs/JOB_ID"
-```
-
-## Configuration
-
-Settings are loaded from the environment (and optionally a `.env` file). Names map from the fields in `app/config.py` (for example `redis_url` → `REDIS_URL`).
+### vlm_analyzer (`app/config.py`)
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
-| `REDIS_URL` | Redis DB for job/stream/insight state | `redis://localhost:6379/0` |
-| `CELERY_BROKER_URL` | Celery broker | `redis://localhost:6379/1` |
+| `REDIS_URL` | Redis for job/stream/insight state | `redis://localhost:6379/0` |
+| `CELERY_BROKER_URL` | Celery broker | `redis://redis:6379/1` |
 | `OLLAMA_BASE_URL` | Ollama HTTP base | `http://127.0.0.1:11434` |
-| `TEMP_DIR` | Temp workspace for chunks | `/tmp/vlm_jobs` |
-| `VIDEO_MOUNT` | Root directory validated for file sources | `/data/videos` |
-| `ENABLE_NVDEC` | Hardware decode toggle (see code) | `false` |
+| `OPENCLAW_BUS_ENABLED` | Publish insights to Redis Streams | `false` |
+| `OPENCLAW_INSIGHTS_STREAM` | Stream key for VLM completions | `openclaw:insights` |
+| `OPENCLAW_ALERTS_STREAM` | Stream key for detected alerts | `openclaw:alerts` |
+| `OPENCLAW_STREAM_MAXLEN` | Maximum entries kept per stream | `10000` |
+| `TEMP_DIR` | Temp workspace for video chunks | `/tmp/vlm_jobs` |
+| `VIDEO_MOUNT` | Root for validated file sources | `/data/videos` |
+| `ENABLE_NVDEC` | NVIDIA hardware decode | `false` |
 
-Optional tuning (limits, TTLs, insight list caps) is also defined in `app/config.py`.
+### package_delivery_alert skill
 
-## Local development (without Docker)
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `RTSP_URL` | Camera RTSP URL | **required** |
+| `VLM_BASE_URL` | vlm_analyzer API URL | `http://localhost:8000` |
+| `VLM_MODEL` | Ollama model | `llava` |
+| `CHUNK_SECONDS` | Video window per analysis | `30` |
+| `FRAMES_PER_CHUNK` | Frames sampled per chunk | `3` |
+| `REDIS_URL` | Redis for event bus | `redis://localhost:6379/0` |
+| `DETECTION_THRESHOLD` | Minimum score to fire an alert | `2` |
+| `COOLDOWN_SECONDS` | Suppress duplicate alerts | `300` |
 
-1. Start Redis locally (`redis-server` or a container).
-2. Install dependencies:
+### discord_notifier consumer
 
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `DISCORD_WEBHOOK_URL` | Discord incoming webhook | **required** |
+| `REDIS_URL` | Redis for event bus | `redis://localhost:6379/0` |
+| `DISCORD_MENTION` | Mention string prepended to alerts | *(none)* |
+
+---
+
+## Local Development (without Docker)
+
+1. Start Redis:
    ```bash
-   python -m venv .venv
-   source .venv/bin/activate  # Windows: .venv\Scripts\activate
-   pip install -r requirements.txt
+   redis-server
    ```
 
-3. Ensure Ollama is running and models are pulled (for example `llava` or your chosen VLM).
-4. Run the API:
-
+2. Install vlm_analyzer dependencies and start the API:
    ```bash
+   pip install -r requirements.txt
    uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
    ```
 
-5. In another terminal, run a worker from the same environment and working directory:
-
+3. Start a Celery worker:
    ```bash
-   celery -A app.worker.celery_app worker --loglevel=info
+   OPENCLAW_BUS_ENABLED=true celery -A app.worker.celery_app worker --loglevel=info
    ```
 
-## Project layout
+4. Run a skill (from repo root so `common/` is on the path):
+   ```bash
+   cd skills/package_delivery_alert
+   PYTHONPATH=../.. RTSP_URL=rtsp://... python skill.py
+   ```
 
-| Path | Role |
-|------|------|
-| `app/main.py` | FastAPI application entry |
-| `app/api/routes.py` | HTTP routes (`/v1/*`) |
-| `app/worker/` | Celery app and tasks |
-| `app/services/` | VLM/Ollama, chunking, OpenAI-compat helpers |
-| `app/state/` | Redis-backed stores |
-| `app/schemas/` | Pydantic request/response models |
-| `docker-compose.yml` | API, worker, Redis stack |
-| `Dockerfile` | API/worker image (Python 3.12, FFmpeg) |
+5. Run a consumer (from repo root):
+   ```bash
+   cd consumers/discord_notifier
+   PYTHONPATH=../.. DISCORD_WEBHOOK_URL=https://... python consumer.py
+   ```
 
-## API summary
+---
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/v1/health` | Liveness and Redis connectivity |
-| `POST` | `/v1/jobs` | Queue file-based video job |
-| `GET` | `/v1/jobs/{job_id}` | Job status and results metadata |
-| `GET` | `/v1/jobs/{job_id}/results` | Job results |
-| `POST` | `/v1/streams` | Register RTSP stream processing |
-| `GET` | `/v1/streams` | List active streams |
-| `GET` | `/v1/streams/{stream_id}` | Stream detail |
-| `DELETE` | `/v1/streams/{stream_id}` | Stop stream |
-| `GET` | `/v1/insights` | List insights (optional `stream_id` filter) |
-| `GET` | `/v1/streams/{stream_id}/insights` | Insights for one stream |
-| `POST` | `/v1/chat/completions` | OpenAI-style chat/vision (non-streaming) |
+## Adding a New Skill
 
-Prefer `/docs` for authoritative request bodies and response shapes.
+1. Create `skills/<skill_name>/` with `skill.py`, `detector.py`, `config.py`, `.env.example`, `Dockerfile`.
+2. In `skill.py`:
+   - Register camera(s) with vlm_analyzer via `POST /v1/streams`.
+   - Use `EventBus.ensure_consumer_group("openclaw:insights", "<skill_name>")`.
+   - Loop on `EventBus.consume(...)`, filter by `stream_id`, run detection.
+   - On detection call `EventBus.publish("openclaw:alerts", AlertEvent(...))`.
+3. Add `AlertEvent` field `"skill": "<skill_name>"` so consumers can label it.
+4. Add the service to `docker-compose.yml` with build context set to the repo root.
+5. Add a row to the skills table in this README.
+
+---
+
+## Further Reading
+
+- Interactive API docs (when the server is running): http://localhost:8000/docs
+- [Ollama API](https://github.com/ollama/ollama/blob/main/docs/api.md)
+- [Redis Streams](https://redis.io/docs/data-types/streams/)
