@@ -29,6 +29,12 @@ class Settings(BaseSettings):
     insights_job_list_prefix: str = "insights:job:"
     insights_max_per_list: int = 10_000
 
+    # OpenClaw event bus — set OPENCLAW_BUS_ENABLED=true to publish to Redis Streams
+    openclaw_bus_enabled: bool = False
+    openclaw_insights_stream: str = "openclaw:insights"
+    openclaw_alerts_stream: str = "openclaw:alerts"
+    openclaw_stream_maxlen: int = 10_000
+
 
 @lru_cache
 def get_settings() -> Settings:

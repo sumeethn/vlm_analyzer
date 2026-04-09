@@ -23,6 +23,7 @@ services:
       TEMP_DIR: /tmp/vlm_jobs
       VIDEO_MOUNT: /data/videos
       ENABLE_NVDEC: "0"
+      OPENCLAW_BUS_ENABLED: "true"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -42,6 +43,7 @@ services:
       TEMP_DIR: /tmp/vlm_jobs
       VIDEO_MOUNT: /data/videos
       ENABLE_NVDEC: "0"
+      OPENCLAW_BUS_ENABLED: "true"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -51,17 +53,35 @@ services:
       redis:
         condition: service_healthy
 
+  # ── OpenClaw skills ────────────────────────────────────────────────────────
+
   package_delivery_alert:
     build:
-      context: skills/package_delivery_alert
-      dockerfile: Dockerfile
+      context: .          # repo root — needed to include common/
+      dockerfile: skills/package_delivery_alert/Dockerfile
     env_file:
       - skills/package_delivery_alert/.env
     environment:
       VLM_BASE_URL: http://api:8000
+      REDIS_URL: redis://redis:6379/0
     restart: unless-stopped
     depends_on:
       - api
+      - redis
+
+  # ── OpenClaw consumers ─────────────────────────────────────────────────────
+
+  discord_notifier:
+    build:
+      context: .          # repo root — needed to include common/
+      dockerfile: consumers/discord_notifier/Dockerfile
+    env_file:
+      - consumers/discord_notifier/.env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    restart: unless-stopped
+    depends_on:
+      - redis
 
 volumes:
   redis_data:

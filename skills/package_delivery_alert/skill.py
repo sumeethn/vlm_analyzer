@@ -2,12 +2,14 @@
 package_delivery_alert — OpenClaw skill
 
 Registers a front-yard camera RTSP stream with the vlm_analyzer microservice,
-polls for new insights, and sends a Discord notification whenever a package
-delivery is detected in the VLM response.
+then subscribes to the  openclaw:insights  Redis Stream.  When the VLM
+response for this camera scores above the detection threshold the skill
+publishes an alert event to  openclaw:alerts  for any downstream consumer
+(e.g. discord_notifier) to handle.
 
 Usage
 -----
-Set the required environment variables (see config.py or .env.example), then:
+Set the required environment variables (see .env.example), then:
 
     python skill.py
 
@@ -20,14 +22,14 @@ import logging
 import signal
 import sys
 import time
-import urllib.error
-import urllib.parse
 import urllib.request
 from typing import Any
 
 from config import SkillConfig, load_config
 from detector import detect_package_delivery
-from notifier import NotifierConfig, send_delivery_alert
+
+# common/ is on PYTHONPATH (set by Dockerfile / local runner)
+from common.event_bus import EventBus
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,30 +38,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger("package_delivery_alert")
 
+_SKILL_ID = "package_delivery_alert"
+_CONSUMER_NAME = "worker-1"
+
 
 # ---------------------------------------------------------------------------
-# vlm_analyzer API helpers
+# vlm_analyzer stream registration
 # ---------------------------------------------------------------------------
 
-def _api_request(
-    method: str,
-    url: str,
-    payload: dict | None = None,
-    timeout: float = 15.0,
-) -> dict[str, Any]:
-    """Perform a JSON HTTP request and return the parsed response body."""
+def _api_request(method: str, url: str, payload: dict | None = None) -> dict[str, Any]:
     body = json.dumps(payload).encode() if payload is not None else None
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(req, timeout=15) as resp:
         return json.loads(resp.read())
 
 
 def register_stream(cfg: SkillConfig) -> str:
-    """
-    POST /v1/streams to register the RTSP stream.
-    Returns the stream_id assigned by vlm_analyzer.
-    """
+    """POST /v1/streams to register the RTSP camera. Returns stream_id."""
     url = f"{cfg.vlm_base_url}/v1/streams"
     payload = {
         "rtsp_url": cfg.rtsp_url,
@@ -77,7 +73,7 @@ def register_stream(cfg: SkillConfig) -> str:
 
 
 def stop_stream(base_url: str, stream_id: str) -> None:
-    """DELETE /v1/streams/{stream_id} to gracefully stop the stream."""
+    """DELETE /v1/streams/{stream_id} to stop processing."""
     url = f"{base_url}/v1/streams/{stream_id}"
     try:
         req = urllib.request.Request(url, method="DELETE")
@@ -88,72 +84,15 @@ def stop_stream(base_url: str, stream_id: str) -> None:
         logger.warning("Could not stop stream %s: %s", stream_id, exc)
 
 
-def fetch_insights(
-    base_url: str,
-    stream_id: str,
-    limit: int = 100,
-    offset: int = 0,
-) -> list[dict[str, Any]]:
-    """
-    GET /v1/streams/{stream_id}/insights and return the insight list.
-    Insights are returned newest-first (Redis LPUSH order).
-    """
-    url = (
-        f"{base_url}/v1/streams/{stream_id}/insights"
-        f"?limit={limit}&offset={offset}"
-    )
-    resp = _api_request("GET", url)
-    return resp.get("insights", [])
-
-
 # ---------------------------------------------------------------------------
-# State: track which insight_ids we have already evaluated
+# Core event loop
 # ---------------------------------------------------------------------------
-
-class _SeenSet:
-    """In-memory set of processed insight_ids, bounded to avoid unbounded growth."""
-
-    _MAX = 10_000
-
-    def __init__(self) -> None:
-        self._ids: set[str] = set()
-        self._ordered: list[str] = []
-
-    def seen(self, insight_id: str) -> bool:
-        return insight_id in self._ids
-
-    def mark(self, insight_id: str) -> None:
-        if insight_id in self._ids:
-            return
-        if len(self._ids) >= self._MAX:
-            evict = self._ordered.pop(0)
-            self._ids.discard(evict)
-        self._ids.add(insight_id)
-        self._ordered.append(insight_id)
-
-
-# ---------------------------------------------------------------------------
-# Core polling loop
-# ---------------------------------------------------------------------------
-
-def _extract_text(insight: dict[str, Any]) -> str | None:
-    """Pull the assistant text out of an InsightRecord completion."""
-    try:
-        return insight["completion"]["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError):
-        return None
-
 
 def run(cfg: SkillConfig) -> None:
-    notifier_cfg = NotifierConfig(
-        webhook_url=cfg.discord_webhook_url,
-        mention=cfg.discord_mention,
-    )
-    seen = _SeenSet()
+    bus = EventBus(redis_url=cfg.redis_url, stream_maxlen=cfg.stream_maxlen)
     last_alert_ts: float = 0.0
     stream_id: str | None = None
 
-    # --- graceful shutdown ---
     shutdown_requested = False
 
     def _handle_signal(sig: int, _frame: Any) -> None:
@@ -164,7 +103,7 @@ def run(cfg: SkillConfig) -> None:
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
-    # --- register stream ---
+    # Register camera stream with vlm_analyzer
     while not shutdown_requested:
         try:
             stream_id = register_stream(cfg)
@@ -176,42 +115,37 @@ def run(cfg: SkillConfig) -> None:
     if shutdown_requested or stream_id is None:
         return
 
+    # Create consumer group on the insights stream.
+    # id="$" means: only process insights produced after this skill starts.
+    bus.ensure_consumer_group(cfg.insights_stream, _SKILL_ID)
+
     logger.info(
-        "Polling insights every %.0fs (detection threshold=%d, cooldown=%.0fs) …",
-        cfg.poll_interval_seconds,
+        "Subscribed to %s as consumer group '%s' (detection threshold=%d, cooldown=%.0fs).",
+        cfg.insights_stream,
+        _SKILL_ID,
         cfg.detection_threshold,
         cfg.cooldown_seconds,
     )
 
-    # --- polling loop ---
     try:
         while not shutdown_requested:
-            try:
-                insights = fetch_insights(cfg.vlm_base_url, stream_id)
-            except Exception as exc:
-                logger.warning("Failed to fetch insights: %s", exc)
-                _interruptible_sleep(cfg.poll_interval_seconds, lambda: shutdown_requested)
-                continue
+            for msg_id, fields in bus.consume(cfg.insights_stream, _SKILL_ID, _CONSUMER_NAME):
+                if shutdown_requested:
+                    bus.ack(cfg.insights_stream, _SKILL_ID, msg_id)
+                    break
 
-            new_count = 0
-            for insight in insights:
-                insight_id = insight.get("insight_id", "")
-                if seen.seen(insight_id):
-                    continue
-                seen.mark(insight_id)
-                new_count += 1
-
-                text = _extract_text(insight)
-                if not text:
-                    logger.debug("Insight %s has no text content, skipping.", insight_id)
+                # Filter: only process insights from our registered camera stream
+                if fields.get("stream_id") != stream_id:
+                    bus.ack(cfg.insights_stream, _SKILL_ID, msg_id)
                     continue
 
-                chunk_index = insight.get("chunk_index", -1)
-                result = detect_package_delivery(text, cfg.detection_threshold)
+                content = fields.get("content", "")
+                chunk_index = fields.get("chunk_index", "-1")
+
+                result = detect_package_delivery(content, cfg.detection_threshold)
 
                 logger.info(
-                    "Insight %s (chunk=%s): score=%d detected=%s matched=%s",
-                    insight_id,
+                    "Insight (chunk=%s): score=%d detected=%s matched=%s",
                     chunk_index,
                     result.score,
                     result.detected,
@@ -225,19 +159,19 @@ def run(cfg: SkillConfig) -> None:
                             "Delivery detected but suppressed (cooldown, %.0fs remaining).",
                             cfg.cooldown_seconds - (now - last_alert_ts),
                         )
-                        continue
-
-                    ok = send_delivery_alert(notifier_cfg, stream_id, chunk_index, result)
-                    if ok:
-                        logger.info("Discord alert sent for insight %s.", insight_id)
-                        last_alert_ts = now
                     else:
-                        logger.error("Discord alert failed for insight %s.", insight_id)
+                        bus.publish(cfg.alerts_stream, {
+                            "skill": _SKILL_ID,
+                            "stream_id": stream_id,
+                            "chunk_index": chunk_index,
+                            "score": str(result.score),
+                            "matched": ",".join(result.matched_groups),
+                            "excerpt": result.excerpt,
+                        })
+                        logger.info("Alert published to %s.", cfg.alerts_stream)
+                        last_alert_ts = now
 
-            if new_count:
-                logger.debug("Processed %d new insight(s).", new_count)
-
-            _interruptible_sleep(cfg.poll_interval_seconds, lambda: shutdown_requested)
+                bus.ack(cfg.insights_stream, _SKILL_ID, msg_id)
 
     finally:
         if stream_id:
@@ -245,7 +179,6 @@ def run(cfg: SkillConfig) -> None:
 
 
 def _interruptible_sleep(seconds: float, stop: "Callable[[], bool]") -> None:
-    """Sleep for *seconds*, waking early if *stop()* becomes True."""
     deadline = time.monotonic() + seconds
     while not stop():
         remaining = deadline - time.monotonic()
