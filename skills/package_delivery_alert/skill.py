@@ -1,7 +1,7 @@
 """
 package_delivery_alert — OpenClaw skill
 
-Registers a front-yard camera RTSP stream with the vlm_analyzer microservice,
+Registers a front-yard camera RTSP stream with the video-ingest service,
 then subscribes to the  openclaw:insights  Redis Stream.  When the VLM
 response for this camera scores above the detection threshold the skill
 publishes an alert event to  openclaw:alerts  for any downstream consumer
@@ -43,7 +43,7 @@ _CONSUMER_NAME = "worker-1"
 
 
 # ---------------------------------------------------------------------------
-# vlm_analyzer stream registration
+# video-ingest stream registration
 # ---------------------------------------------------------------------------
 
 def _api_request(method: str, url: str, payload: dict | None = None) -> dict[str, Any]:
@@ -65,7 +65,7 @@ def register_stream(cfg: SkillConfig) -> str:
         "prompt": cfg.vlm_prompt,
         "frames_per_chunk": cfg.frames_per_chunk,
     }
-    logger.info("Registering RTSP stream %s with vlm_analyzer …", cfg.rtsp_url)
+    logger.info("Registering RTSP stream %s with video-ingest …", cfg.rtsp_url)
     resp = _api_request("POST", url, payload)
     stream_id: str = resp["stream_id"]
     logger.info("Stream registered → stream_id=%s", stream_id)
@@ -103,7 +103,7 @@ def run(cfg: SkillConfig) -> None:
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
-    # Register camera stream with vlm_analyzer
+    # Register camera stream with video-ingest
     while not shutdown_requested:
         try:
             stream_id = register_stream(cfg)

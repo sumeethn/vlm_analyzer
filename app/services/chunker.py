@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import threading
 import uuid
+import json
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -106,6 +107,44 @@ def probe_duration_seconds(path: str) -> float | None:
         return float(v) if v else None
     except Exception:
         return None
+
+
+def probe_media_streams(uri: str, kind: str) -> list[dict]:
+    args = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_streams",
+        "-of",
+        "json",
+    ]
+    if kind == "rtsp":
+        args.extend(rtsp_input_options())
+    args.append(uri)
+    try:
+        r = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except Exception:
+        return []
+    if r.returncode != 0:
+        return []
+    try:
+        payload = json.loads(r.stdout or "{}")
+    except json.JSONDecodeError:
+        return []
+    streams = payload.get("streams")
+    if not isinstance(streams, list):
+        return []
+    return [stream for stream in streams if isinstance(stream, dict)]
+
+
+def source_has_audio(uri: str, kind: str) -> bool:
+    return any(stream.get("codec_type") == "audio" for stream in probe_media_streams(uri, kind))
 
 
 def build_input_args(uri: str, kind: str, *, use_nvdec: bool) -> list[str]:

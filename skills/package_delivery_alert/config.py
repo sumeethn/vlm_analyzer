@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 
 @dataclass
 class SkillConfig:
-    # --- vlm_analyzer ---
+    # --- video-ingest API ---
     vlm_base_url: str = field(
         default_factory=lambda: os.environ.get("VLM_BASE_URL", "http://localhost:8000")
     )

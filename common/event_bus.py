@@ -93,6 +93,65 @@ class EventBus:
             for msg_id, fields in entries:
                 yield msg_id, fields
 
+    def claim_stale(
+        self,
+        stream: str,
+        group: str,
+        consumer: str,
+        *,
+        min_idle_ms: int,
+        start_id: str = "0-0",
+        count: int = 10,
+    ) -> tuple[str, list[tuple[str, dict[str, str]]]]:
+        """
+        Re-claim stale pending messages for *group*.
+
+        Returns ``(next_start_id, claimed_entries)`` so callers can resume the
+        scan in a later polling loop.
+        """
+        try:
+            raw = self._r.xautoclaim(
+                stream,
+                group,
+                consumer,
+                min_idle_ms=min_idle_ms,
+                start_id=start_id,
+                count=count,
+            )
+        except redis_lib.exceptions.ResponseError as exc:
+            logger.error("xautoclaim failed: %s", exc)
+            return start_id, []
+
+        next_id = start_id
+        entries: list[tuple[str, dict[str, str]]] = []
+        if isinstance(raw, (list, tuple)) and len(raw) >= 2:
+            next_id = str(raw[0])
+            claimed = raw[1] or []
+            for msg_id, fields in claimed:
+                entries.append((msg_id, fields))
+        return next_id, entries
+
+    def pending_count(self, stream: str, group: str) -> int:
+        try:
+            summary = self._r.xpending(stream, group)
+        except redis_lib.exceptions.ResponseError as exc:
+            logger.error("xpending failed: %s", exc)
+            return 0
+
+        if isinstance(summary, dict):
+            pending = summary.get("pending")
+            return int(pending or 0)
+        if isinstance(summary, (list, tuple)) and summary:
+            return int(summary[0] or 0)
+        return 0
+
+    def stream_length(self, stream: str) -> int:
+        try:
+            return int(self._r.xlen(stream))
+        except redis_lib.RedisError as exc:
+            logger.error("xlen failed: %s", exc)
+            return 0
+
     def ack(self, stream: str, group: str, msg_id: str) -> None:
         """Acknowledge a consumed message so it is not redelivered."""
         self._r.xack(stream, group, msg_id)
