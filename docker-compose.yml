@@ -47,7 +47,6 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - job_temp:/tmp/vlm_jobs
       - frame_batch_data:/var/lib/nova/frame_batches
       - ./samples:/data/videos:ro
     depends_on:
@@ -107,5 +106,4 @@ services:
 
 volumes:
   redis_data:
-  job_temp:
   frame_batch_data:

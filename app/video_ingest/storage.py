@@ -133,7 +133,11 @@ class FrameBatchStorage:
         manifest: FrameBatchManifest,
         completion: dict[str, Any],
     ) -> str:
-        completion_path = Path(manifest.manifest_path or "").with_name("completion.json")
+        if not manifest.manifest_path:
+            raise ValueError(
+                f"manifest_path is required to write completion for batch {manifest.batch_id}"
+            )
+        completion_path = Path(manifest.manifest_path).with_name("completion.json")
         completion_path.write_text(
             json.dumps(completion, indent=2, sort_keys=True),
             encoding="utf-8",

@@ -28,7 +28,6 @@ from app.schemas.streams import (
     StreamListItem,
 )
 from app.services.openai_compat import ollama_to_openai_chat_completion
-from app.services.chunker import source_has_audio
 from app.services.vlm import (
     extract_text_and_image_b64_from_openai_messages,
     merge_ollama_chat_options,
@@ -192,7 +191,8 @@ async def register_stream(
     fpc = _resolve_frames_per_chunk(body.frames_per_chunk, settings)
 
     stream_store = StreamStore(settings)
-    has_audio = source_has_audio(body.rtsp_url, "rtsp")
+    # has_audio is probed once at Celery worker startup (source_has_audio runs
+    # ffprobe which can take up to 15 s — too slow for an async API handler).
     stream_id = stream_store.create_stream(
         {
             "rtsp_uri": body.rtsp_url,
@@ -204,7 +204,7 @@ async def register_stream(
             "frames_per_chunk": fpc,
             "pending_batches": 0,
             "ollama_options": body.ollama_options,
-            "has_audio": has_audio,
+            "has_audio": False,
         }
     )
     process_rtsp_stream.delay(stream_id)

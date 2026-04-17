@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from typing import Any, Literal
 
 from pydantic import BaseModel
@@ -83,6 +82,3 @@ class CaptionRecord(BaseModel):
     @classmethod
     def from_json(cls, payload: str) -> "CaptionRecord":
         return cls.model_validate_json(payload)
-
-    def completion_json(self) -> str:
-        return json.dumps(self.completion or {})

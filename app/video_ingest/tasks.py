@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from app.config import get_settings
+from app.services.chunker import source_has_audio
 from app.state.jobs import JobStore, validate_file_under_mount
 from app.state.streams import StreamStore
 from app.video_ingest.media_pipeline import create_file_batches, create_stream_batch
@@ -39,7 +40,19 @@ def _publish_frame_batch(event_fields: dict[str, str]) -> None:
     bus.publish(settings.frame_batch_ready_stream, event_fields)
 
 
-def _wait_for_job_capacity(store: JobStore, settings: Any, job_id: str, max_inflight: int) -> dict[str, Any] | None:
+def _wait_for_job_capacity(
+    store: JobStore,
+    settings: Any,
+    job_id: str,
+    max_inflight: int,
+) -> dict[str, Any] | None:
+    """
+    Poll until inflight batch count drops below *max_inflight*.
+
+    Raises ``TimeoutError`` if the backpressure deadline is exceeded; this is
+    appropriate for finite jobs because exceeding the deadline indicates a
+    stalled captioner that should not accept more work.
+    """
     deadline = time.monotonic() + settings.max_backpressure_wait_seconds
     while True:
         job = store.get(job_id)
@@ -61,6 +74,13 @@ def _wait_for_stream_capacity(
     max_inflight: int,
     chunk_seconds: float,
 ) -> dict[str, Any] | None:
+    """
+    Poll until inflight batch count drops below *max_inflight*.
+
+    For RTSP streams this never raises — if the captioner is backlogged we
+    log a warning and return the current stream state so the caller can skip
+    the current chunk interval rather than killing the stream worker.
+    """
     deadline = time.monotonic() + settings.max_backpressure_wait_seconds
     while True:
         stream = stream_store.get(stream_id)
@@ -71,31 +91,38 @@ def _wait_for_stream_capacity(
         if int(stream.get("pending_batches", 0)) < max_inflight:
             return stream
         if time.monotonic() >= deadline:
-            raise TimeoutError(f"stream {stream_id} exceeded backpressure wait limit")
+            logger.warning(
+                "stream %s backpressure timeout reached (%ss); skipping batch for this cycle",
+                stream_id,
+                settings.max_backpressure_wait_seconds,
+            )
+            # Return the current state tagged so the caller knows to skip.
+            return {**stream, "_backpressure_skip": True}
         time.sleep(min(max(chunk_seconds, settings.backpressure_poll_seconds), 5.0))
 
 
 def _finalize_stream_stopped(
     stream_store: StreamStore,
     stream_id: str,
-    *,
-    stream: dict[str, Any] | None = None,
 ) -> None:
-    if stream is not None:
-        def _stop(existing: dict[str, Any]) -> dict[str, Any]:
-            existing["status"] = "stopped"
-            return existing
-
-        stream_store.update(stream_id, _stop)
-    else:
-        stream_store.update(
-            stream_id,
-            lambda existing: {**existing, "status": "stopped"},
-        )
+    stream_store.update(
+        stream_id,
+        lambda existing: {**existing, "status": "stopped"},
+    )
     stream_store.remove_from_active(stream_id)
     wr = Path(get_settings().temp_dir) / "streams" / stream_id
     if wr.exists():
         shutil.rmtree(wr, ignore_errors=True)
+
+
+# ── Publication counter mutator (hoisted out of the publish loop) ─────────────
+
+def _record_publication_mutator(existing: dict[str, Any]) -> dict[str, Any]:
+    if existing.get("status") == "failed":
+        return existing
+    existing["pending_batches"] = int(existing.get("pending_batches", 0)) + 1
+    existing["published_batches"] = int(existing.get("published_batches", 0)) + 1
+    return existing
 
 
 @celery_app.task(name="process_video_job")
@@ -111,6 +138,7 @@ def process_video_job(job_id: str) -> None:
     work_root = Path(settings.temp_dir) / job_id
     try:
         storage.cleanup_expired_batches()
+
         def _mark_running(existing: dict[str, Any]) -> dict[str, Any]:
             existing["status"] = "running"
             existing.setdefault("results", [])
@@ -121,7 +149,13 @@ def process_video_job(job_id: str) -> None:
             existing["error"] = None
             return existing
 
-        job = store.update(job_id, _mark_running) or job
+        # Use the returned updated dict so that default-initialised fields
+        # (e.g. pending_batches, results) are present for the rest of the task.
+        updated_job = store.update(job_id, _mark_running)
+        if updated_job is None:
+            logger.error("job %s disappeared after initial get", job_id)
+            return
+        job = updated_job
 
         sources = job["sources"]
         chunk_seconds = float(job["chunk_seconds"])
@@ -180,16 +214,10 @@ def process_video_job(job_id: str) -> None:
                 if job.get("status") in {"failed", "completed"}:
                     return
                 _publish_frame_batch(storage.manifest_to_event(manifest).to_stream_fields())
-                def _record_publication(existing: dict[str, Any]) -> dict[str, Any]:
-                    if existing.get("status") == "failed":
-                        return existing
-                    existing["pending_batches"] = int(existing.get("pending_batches", 0)) + 1
-                    existing["published_batches"] = int(existing.get("published_batches", 0)) + 1
-                    return existing
-
-                store.update(job_id, _record_publication)
+                store.update(job_id, _record_publication_mutator)
     except Exception as e:
         logger.exception("job %s failed", job_id)
+
         def _mark_failed(existing: dict[str, Any]) -> dict[str, Any]:
             existing["status"] = "failed"
             existing["error"] = str(e)
@@ -211,6 +239,21 @@ def process_rtsp_stream(stream_id: str) -> None:
 
     try:
         storage.cleanup_expired_batches()
+
+        # ── Probe audio once per task invocation ─────────────────────────────
+        # Running ffprobe in an async FastAPI handler would block the event
+        # loop.  We do it here instead, before the main loop, and cache the
+        # result in a local variable for the lifetime of this task.
+        initial_s = stream_store.get(stream_id)
+        if not initial_s:
+            logger.info("stream %s not found on startup, exiting", stream_id)
+            return
+        uri = initial_s["rtsp_uri"]
+        has_audio = source_has_audio(uri, "rtsp")
+        logger.info("stream %s audio detected: %s", stream_id, has_audio)
+        # Persist so the stored record stays accurate (e.g. for the API GET).
+        stream_store.update(stream_id, lambda s: {**s, "has_audio": has_audio})
+
         while True:
             s = stream_store.get(stream_id)
             if not s:
@@ -227,7 +270,7 @@ def process_rtsp_stream(stream_id: str) -> None:
                 return
 
             if s["status"] == "stopping":
-                _finalize_stream_stopped(stream_store, stream_id, stream=s)
+                _finalize_stream_stopped(stream_store, stream_id)
                 return
 
             if s["status"] != "active":
@@ -243,16 +286,18 @@ def process_rtsp_stream(stream_id: str) -> None:
             )
             if not s:
                 return
+            if s.get("_backpressure_skip"):
+                # Captioner is backlogged: sleep one chunk interval and retry.
+                time.sleep(chunk_seconds)
+                continue
             if s.get("status") in {"stopping", "stopped", "failed"}:
                 if s.get("status") == "stopping":
-                    _finalize_stream_stopped(stream_store, stream_id, stream=s)
+                    _finalize_stream_stopped(stream_store, stream_id)
                 return
 
-            uri = s["rtsp_uri"]
             chunk_format = s["chunk_format"]
             frames_per_chunk = int(s.get("frames_per_chunk") or 1)
             seq = int(s["chunk_seq"])
-            has_audio = bool(s.get("has_audio", False))
             processing_config = {
                 "model": s["model"],
                 "prompt": s["prompt"],
@@ -285,6 +330,7 @@ def process_rtsp_stream(stream_id: str) -> None:
 
             if exc is not None:
                 logger.exception("stream %s ingest failed after retries", stream_id)
+
                 def _mark_stream_failed(existing: dict[str, Any]) -> dict[str, Any]:
                     existing["status"] = "failed"
                     existing["last_error"] = str(exc)
@@ -300,6 +346,7 @@ def process_rtsp_stream(stream_id: str) -> None:
                 continue
 
             _publish_frame_batch(storage.manifest_to_event(manifest).to_stream_fields())
+
             def _record_stream_publication(existing: dict[str, Any]) -> dict[str, Any]:
                 existing["chunk_seq"] = max(int(existing.get("chunk_seq", 0)), seq + 1)
                 existing["last_chunk_at"] = time.time()

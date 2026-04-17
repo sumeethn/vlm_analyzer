@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+import uuid
 from typing import Any
 
 import redis
@@ -52,7 +53,7 @@ def publish_legacy_insight(
 ) -> tuple[dict[str, Any], bool]:
     marker_key = f"{settings.caption_key_prefix}published:legacy-insight:{batch_id}"
     record = {
-        "insight_id": batch_id,
+        "insight_id": str(uuid.uuid4()),
         "batch_id": batch_id,
         "ts": time.time(),
         "stream_id": stream_id,

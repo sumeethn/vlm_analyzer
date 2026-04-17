@@ -96,15 +96,36 @@ def _append_job_result(
 
 
 def _mark_job_failed(settings: Settings, job_id: str, record: CaptionRecord, error: str) -> CaptionRecord:
+    """
+    Record a batch failure against a job.
+
+    Rather than immediately poisoning the entire job, this increments a
+    ``failed_batch_count`` counter and decrements ``pending_batches``.  The
+    job transitions to ``"failed"`` only when all expected batches are
+    accounted for (successful + failed == total) and at least one failed.
+    This avoids marking a 20-batch job as failed the moment the first batch
+    hits its retry limit while 19 others are still pending.
+    """
     if record.job_failure_recorded:
         return record
     store = JobStore(settings)
     marker = f"{settings.caption_key_prefix}job-failure:{record.batch_id}"
 
     def _mutate(job: dict[str, Any]) -> dict[str, Any]:
-        job["status"] = "failed"
-        job["error"] = error
+        failed_count = int(job.get("failed_batch_count", 0)) + 1
+        job["failed_batch_count"] = failed_count
         job["pending_batches"] = max(0, int(job.get("pending_batches", 0)) - 1)
+        # chunks_done tracks all finished batches (success + failure).
+        chunks_done = max(
+            int(job.get("chunks_done", 0)),
+            len(job.get("results", [])) + failed_count,
+        )
+        job["chunks_done"] = chunks_done
+        job["last_error"] = error
+        chunks_total = int(job.get("chunks_total", 0))
+        if chunks_total and chunks_done >= chunks_total:
+            job["status"] = "failed"
+            job["error"] = error
         return job
 
     if store.update_once(
@@ -238,20 +259,60 @@ def _ensure_publications(
     return record
 
 
+def _update_manifest_captioned(
+    settings: Settings,
+    storage: FrameBatchStorage,
+    event: FrameBatchReadyEvent,
+    record: CaptionRecord,
+) -> None:
+    """Write 'captioned' status to the on-disk manifest, tolerating stale paths."""
+    try:
+        storage.mark_manifest(
+            event.manifest_path,
+            status="captioned",
+            cleanup_after_ts=time.time() + settings.frame_batch_retention_seconds,
+            caption_completed_at=record.updated_at,
+            attempt=record.attempt,
+        )
+    except Exception:
+        logger.warning(
+            "could not update manifest status for batch %s (path=%s)",
+            event.batch_id,
+            event.manifest_path,
+            exc_info=True,
+        )
+
+
 def process_frame_batch(
     settings: Settings,
     event: FrameBatchReadyEvent,
 ) -> None:
     storage = FrameBatchStorage(settings)
     captions = CaptionStore(settings)
-    manifest = FrameBatchManifest.read_json(Path(event.manifest_path))
+
+    # Guard against messages for batches whose on-disk artifacts were already
+    # cleaned up (e.g. on fresh captioner deployment against an old stream).
+    manifest_path = Path(event.manifest_path)
+    if not manifest_path.exists():
+        logger.warning(
+            "manifest not found for batch %s (path=%s); batch artifacts may have been "
+            "cleaned up — treating as permanently skipped",
+            event.batch_id,
+            event.manifest_path,
+        )
+        return  # caller will ACK; no retry
+
+    manifest = FrameBatchManifest.read_json(manifest_path)
     existing = captions.get(event.batch_id)
+
     if existing and existing.status == "completed":
         existing = _ensure_publications(settings, captions, storage, manifest, existing)
         if event.job_id and existing.completion:
             existing = _append_job_result(settings, manifest, existing)
         if event.stream_id:
             existing = _mark_stream_batch_done(settings, event.stream_id, existing)
+        # Ensure on-disk manifest reflects captioned status even on re-delivery.
+        _update_manifest_captioned(settings, storage, event, existing)
         captions.save(existing)
         return
 
@@ -314,6 +375,10 @@ def process_frame_batch(
             record = _mark_stream_batch_done(settings, event.stream_id, record)
         captions.save(record)
     except Exception as exc:
+        # If inference succeeded but a downstream side effect (publication,
+        # manifest update, state update) raised, preserve the completed state
+        # so the re-delivery path can finish publishing without re-running
+        # inference.
         if record.status == "completed" and record.completion:
             record.error = str(exc)
             captions.save(record)
@@ -338,10 +403,12 @@ def process_frame_batch(
 
 def run_consumer(settings: Settings) -> None:
     bus = EventBus(settings.redis_url, stream_maxlen=settings.frame_batch_stream_maxlen)
+    # Use id="$" so a fresh deployment does not replay all historical entries.
+    # Stale messages from a crash are recovered via claim_stale (XAUTOCLAIM).
     bus.ensure_consumer_group(
         settings.frame_batch_ready_stream,
         settings.frame_batch_stream_group,
-        start_id="0",
+        start_id="$",
     )
     shutdown_requested = False
     claim_cursor = "0-0"

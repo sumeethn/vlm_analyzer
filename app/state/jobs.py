@@ -35,16 +35,16 @@ class JobStore:
         job_id = data["job_id"]
         key = self._key(job_id)
         blob = json.dumps(data)
-        if self._r.exists(key):
-            try:
-                self._r.set(key, blob, keepttl=True)
-            except redis.RedisError:
+        try:
+            if self._r.exists(key):
                 ttl = self._r.ttl(key)
                 if ttl is not None and ttl > 0:
                     self._r.setex(key, ttl, blob)
                 else:
                     self._r.setex(key, self.ttl, blob)
-        else:
+            else:
+                self._r.setex(key, self.ttl, blob)
+        except redis.RedisError:
             self._r.setex(key, self.ttl, blob)
 
     def update(
@@ -52,6 +52,14 @@ class JobStore:
         job_id: str,
         mutator: Callable[[dict[str, Any]], dict[str, Any] | None],
     ) -> dict[str, Any] | None:
+        """
+        Optimistic-lock read-modify-write on a job key.
+
+        Reads the current TTL while in WATCH mode and preserves it via
+        setex inside the MULTI block.  This avoids keepttl=True (Redis 6.0+
+        only) and the dead try/except pattern that could never fire inside a
+        MULTI block.
+        """
         key = self._key(job_id)
         with self._r.pipeline() as pipe:
             while True:
@@ -66,15 +74,12 @@ class JobStore:
                     if updated is None:
                         pipe.unwatch()
                         return current
+                    # Read TTL while still in watch (immediate) mode so we
+                    # can replicate it inside MULTI without keepttl=True.
+                    ttl = pipe.ttl(key)
+                    effective_ttl = ttl if (ttl is not None and ttl > 0) else self.ttl
                     pipe.multi()
-                    try:
-                        pipe.set(key, json.dumps(updated), keepttl=True)
-                    except redis.RedisError:
-                        ttl = self._r.ttl(key)
-                        if ttl is not None and ttl > 0:
-                            pipe.setex(key, ttl, json.dumps(updated))
-                        else:
-                            pipe.setex(key, self.ttl, json.dumps(updated))
+                    pipe.setex(key, effective_ttl, json.dumps(updated))
                     pipe.execute()
                     return updated
                 except redis.WatchError:
@@ -90,6 +95,10 @@ class JobStore:
         marker_ttl_seconds: int,
         mutator: Callable[[dict[str, Any]], dict[str, Any] | None],
     ) -> tuple[dict[str, Any] | None, bool]:
+        """
+        Idempotent read-modify-write: executes the mutation exactly once,
+        gated by *marker*.  Returns ``(final_state, did_execute)``.
+        """
         key = self._key(job_id)
         with self._r.pipeline() as pipe:
             while True:
@@ -107,9 +116,11 @@ class JobStore:
                     if updated is None:
                         pipe.unwatch()
                         return current, False
+                    ttl = pipe.ttl(key)
+                    effective_ttl = ttl if (ttl is not None and ttl > 0) else self.ttl
                     payload = json.dumps(updated)
                     pipe.multi()
-                    pipe.set(key, payload, keepttl=True)
+                    pipe.setex(key, effective_ttl, payload)
                     pipe.setex(marker, marker_ttl_seconds, "1")
                     pipe.execute()
                     return updated, True

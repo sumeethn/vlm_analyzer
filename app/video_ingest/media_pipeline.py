@@ -74,16 +74,45 @@ def _chunk_frames_from_mp4(
     frames_root: Path,
     use_nvdec: bool,
 ) -> list[list[Path]]:
+    """
+    Extract frames from each MP4 chunk.
+
+    The final segment produced by FFmpeg may be shorter than *chunk_seconds*
+    (e.g. tail of a file).  If extracting the requested number of frames
+    fails, we fall back to extracting a single frame before giving up and
+    skipping the chunk entirely.
+    """
     groups: list[list[Path]] = []
     for chunk_index, chunk_path in enumerate(chunk_paths):
-        group = extract_spaced_jpegs_from_mp4(
-            chunk_path,
-            out_dir=frames_root / f"chunk_{chunk_index:06d}",
-            stem="frame",
-            n=frames_per_chunk,
-            use_nvdec=use_nvdec,
-        )
-        groups.append(group)
+        out_dir = frames_root / f"chunk_{chunk_index:06d}"
+        try:
+            group = extract_spaced_jpegs_from_mp4(
+                chunk_path,
+                out_dir=out_dir,
+                stem="frame",
+                n=frames_per_chunk,
+                use_nvdec=use_nvdec,
+            )
+        except (RuntimeError, Exception):
+            if frames_per_chunk <= 1:
+                logger.warning("chunk %s produced no frames, skipping", chunk_path)
+                continue
+            # Fallback: try extracting a single frame from the short segment.
+            try:
+                group = extract_spaced_jpegs_from_mp4(
+                    chunk_path,
+                    out_dir=out_dir,
+                    stem="frame",
+                    n=1,
+                    use_nvdec=use_nvdec,
+                )
+            except (RuntimeError, Exception):
+                logger.warning(
+                    "chunk %s produced no frames even at n=1, skipping", chunk_path
+                )
+                continue
+        if group:
+            groups.append(group)
     return groups
 
 
