@@ -39,17 +39,29 @@ def _publish_frame_batch(event_fields: dict[str, str]) -> None:
     bus.publish(settings.frame_batch_ready_stream, event_fields)
 
 
-def _wait_for_job_capacity(store: JobStore, job_id: str, max_inflight: int) -> dict[str, Any] | None:
+def _wait_for_job_capacity(store: JobStore, settings: Any, job_id: str, max_inflight: int) -> dict[str, Any] | None:
+    deadline = time.monotonic() + settings.max_backpressure_wait_seconds
     while True:
         job = store.get(job_id)
         if not job:
             return None
+        if job.get("status") in {"failed", "completed"}:
+            return job
         if int(job.get("pending_batches", 0)) < max_inflight:
             return job
-        time.sleep(1.0)
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"job {job_id} exceeded backpressure wait limit")
+        time.sleep(settings.backpressure_poll_seconds)
 
 
-def _wait_for_stream_capacity(stream_store: StreamStore, stream_id: str, max_inflight: int, chunk_seconds: float) -> dict[str, Any] | None:
+def _wait_for_stream_capacity(
+    stream_store: StreamStore,
+    settings: Any,
+    stream_id: str,
+    max_inflight: int,
+    chunk_seconds: float,
+) -> dict[str, Any] | None:
+    deadline = time.monotonic() + settings.max_backpressure_wait_seconds
     while True:
         stream = stream_store.get(stream_id)
         if not stream:
@@ -58,7 +70,9 @@ def _wait_for_stream_capacity(stream_store: StreamStore, stream_id: str, max_inf
             return stream
         if int(stream.get("pending_batches", 0)) < max_inflight:
             return stream
-        time.sleep(min(max(chunk_seconds, 0.5), 5.0))
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"stream {stream_id} exceeded backpressure wait limit")
+        time.sleep(min(max(chunk_seconds, settings.backpressure_poll_seconds), 5.0))
 
 
 def _finalize_stream_stopped(
@@ -67,10 +81,17 @@ def _finalize_stream_stopped(
     *,
     stream: dict[str, Any] | None = None,
 ) -> None:
-    s = stream if stream is not None else stream_store.get(stream_id)
-    if s:
-        s["status"] = "stopped"
-        stream_store.save(s)
+    if stream is not None:
+        def _stop(existing: dict[str, Any]) -> dict[str, Any]:
+            existing["status"] = "stopped"
+            return existing
+
+        stream_store.update(stream_id, _stop)
+    else:
+        stream_store.update(
+            stream_id,
+            lambda existing: {**existing, "status": "stopped"},
+        )
     stream_store.remove_from_active(stream_id)
     wr = Path(get_settings().temp_dir) / "streams" / stream_id
     if wr.exists():
@@ -90,19 +111,28 @@ def process_video_job(job_id: str) -> None:
     work_root = Path(settings.temp_dir) / job_id
     try:
         storage.cleanup_expired_batches()
-        job["status"] = "running"
-        job.setdefault("results", [])
-        job.setdefault("pending_batches", 0)
-        job.setdefault("published_batches", 0)
-        job.setdefault("chunks_total", 0)
-        job.setdefault("chunks_done", 0)
-        store.save(job)
+        def _mark_running(existing: dict[str, Any]) -> dict[str, Any]:
+            existing["status"] = "running"
+            existing.setdefault("results", [])
+            existing.setdefault("pending_batches", 0)
+            existing.setdefault("published_batches", 0)
+            existing.setdefault("chunks_total", 0)
+            existing.setdefault("chunks_done", 0)
+            existing["error"] = None
+            return existing
+
+        job = store.update(job_id, _mark_running) or job
 
         sources = job["sources"]
         chunk_seconds = float(job["chunk_seconds"])
         chunk_format = job["chunk_format"]
         max_chunks = int(job["max_chunks_per_source"])
         frames_per_chunk = int(job.get("frames_per_chunk") or 1)
+        processing_config = {
+            "model": job["model"],
+            "prompt": job["prompt"],
+            "ollama_options": job.get("ollama_options") or {},
+        }
 
         manifests_by_source: list[list[Any]] = []
         total_batches = 0
@@ -124,38 +154,48 @@ def process_video_job(job_id: str) -> None:
                 max_chunks=max_chunks,
                 chunk_format=chunk_format,
                 work_dir=work_root,
+                processing_config=processing_config,
             )
             manifests_by_source.append(manifests)
             total_batches += len(manifests)
 
-        job = store.get(job_id) or job
-        job["chunks_total"] = total_batches
-        store.save(job)
+        def _set_total(existing: dict[str, Any]) -> dict[str, Any]:
+            existing["chunks_total"] = total_batches
+            if total_batches == 0 and existing.get("status") != "failed":
+                existing["status"] = "completed"
+            return existing
+
+        store.update(job_id, _set_total)
 
         for manifests in manifests_by_source:
             for manifest in manifests:
-                job = _wait_for_job_capacity(store, job_id, settings.max_inflight_batches_per_job)
+                job = _wait_for_job_capacity(
+                    store,
+                    settings,
+                    job_id,
+                    settings.max_inflight_batches_per_job,
+                )
                 if not job:
                     return
+                if job.get("status") in {"failed", "completed"}:
+                    return
                 _publish_frame_batch(storage.manifest_to_event(manifest).to_stream_fields())
-                job["pending_batches"] = int(job.get("pending_batches", 0)) + 1
-                job["published_batches"] = int(job.get("published_batches", 0)) + 1
-                store.save(job)
+                def _record_publication(existing: dict[str, Any]) -> dict[str, Any]:
+                    if existing.get("status") == "failed":
+                        return existing
+                    existing["pending_batches"] = int(existing.get("pending_batches", 0)) + 1
+                    existing["published_batches"] = int(existing.get("published_batches", 0)) + 1
+                    return existing
 
-        job = store.get(job_id) or job
-        if int(job.get("chunks_total", 0)) == 0:
-            job["status"] = "completed"
-        else:
-            job["status"] = "running"
-        job["error"] = None
-        store.save(job)
+                store.update(job_id, _record_publication)
     except Exception as e:
         logger.exception("job %s failed", job_id)
-        job = store.get(job_id)
-        if job:
-            job["status"] = "failed"
-            job["error"] = str(e)
-            store.save(job)
+        def _mark_failed(existing: dict[str, Any]) -> dict[str, Any]:
+            existing["status"] = "failed"
+            existing["error"] = str(e)
+            return existing
+
+        store.update(job_id, _mark_failed)
         raise
     finally:
         if work_root.exists():
@@ -196,6 +236,7 @@ def process_rtsp_stream(stream_id: str) -> None:
             chunk_seconds = float(s["chunk_seconds"])
             s = _wait_for_stream_capacity(
                 stream_store,
+                settings,
                 stream_id,
                 settings.max_inflight_batches_per_stream,
                 chunk_seconds,
@@ -211,6 +252,12 @@ def process_rtsp_stream(stream_id: str) -> None:
             chunk_format = s["chunk_format"]
             frames_per_chunk = int(s.get("frames_per_chunk") or 1)
             seq = int(s["chunk_seq"])
+            has_audio = bool(s.get("has_audio", False))
+            processing_config = {
+                "model": s["model"],
+                "prompt": s["prompt"],
+                "ollama_options": s.get("ollama_options") or {},
+            }
 
             manifest = None
             exc: Exception | None = None
@@ -226,6 +273,8 @@ def process_rtsp_stream(stream_id: str) -> None:
                         chunk_format=chunk_format,
                         chunk_index=seq,
                         work_dir=work_root / f"iter_{seq}",
+                        has_audio=has_audio,
+                        processing_config=processing_config,
                     )
                     exc = None
                     break
@@ -236,11 +285,12 @@ def process_rtsp_stream(stream_id: str) -> None:
 
             if exc is not None:
                 logger.exception("stream %s ingest failed after retries", stream_id)
-                cur = stream_store.get(stream_id)
-                if cur:
-                    cur["status"] = "failed"
-                    cur["last_error"] = str(exc)
-                    stream_store.save(cur)
+                def _mark_stream_failed(existing: dict[str, Any]) -> dict[str, Any]:
+                    existing["status"] = "failed"
+                    existing["last_error"] = str(exc)
+                    return existing
+
+                stream_store.update(stream_id, _mark_stream_failed)
                 stream_store.remove_from_active(stream_id)
                 return
 
@@ -250,14 +300,15 @@ def process_rtsp_stream(stream_id: str) -> None:
                 continue
 
             _publish_frame_batch(storage.manifest_to_event(manifest).to_stream_fields())
-            s = stream_store.get(stream_id)
-            if not s:
+            def _record_stream_publication(existing: dict[str, Any]) -> dict[str, Any]:
+                existing["chunk_seq"] = max(int(existing.get("chunk_seq", 0)), seq + 1)
+                existing["last_chunk_at"] = time.time()
+                existing["last_error"] = None
+                existing["pending_batches"] = int(existing.get("pending_batches", 0)) + 1
+                return existing
+
+            if stream_store.update(stream_id, _record_stream_publication) is None:
                 return
-            s["chunk_seq"] = seq + 1
-            s["last_chunk_at"] = time.time()
-            s["last_error"] = None
-            s["pending_batches"] = int(s.get("pending_batches", 0)) + 1
-            stream_store.save(s)
 
     finally:
         if work_root.exists():

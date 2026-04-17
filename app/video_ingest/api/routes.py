@@ -28,6 +28,7 @@ from app.schemas.streams import (
     StreamListItem,
 )
 from app.services.openai_compat import ollama_to_openai_chat_completion
+from app.services.chunker import source_has_audio
 from app.services.vlm import (
     extract_text_and_image_b64_from_openai_messages,
     merge_ollama_chat_options,
@@ -191,6 +192,7 @@ async def register_stream(
     fpc = _resolve_frames_per_chunk(body.frames_per_chunk, settings)
 
     stream_store = StreamStore(settings)
+    has_audio = source_has_audio(body.rtsp_url, "rtsp")
     stream_id = stream_store.create_stream(
         {
             "rtsp_uri": body.rtsp_url,
@@ -202,6 +204,7 @@ async def register_stream(
             "frames_per_chunk": fpc,
             "pending_batches": 0,
             "ollama_options": body.ollama_options,
+            "has_audio": has_audio,
         }
     )
     process_rtsp_stream.delay(stream_id)
@@ -269,8 +272,10 @@ async def stop_stream(
     if not s:
         raise HTTPException(status_code=404, detail="stream not found")
     if s["status"] == "active":
-        s["status"] = "stopping"
-        stream_store.save(s)
+        stream_store.update(
+            stream_id,
+            lambda existing: {**existing, "status": "stopping"},
+        )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -389,6 +394,11 @@ async def chat_completions(
     body: ChatCompletionRequest,
     settings: Settings = Depends(get_settings),
 ) -> dict:
+    if not settings.enable_direct_chat_completions:
+        raise HTTPException(
+            status_code=503,
+            detail="direct chat completions are disabled on video-ingest",
+        )
     if body.stream:
         raise HTTPException(status_code=400, detail="stream=false is required")
 

@@ -39,16 +39,16 @@ class EventBus:
     # Consumer group management
     # ------------------------------------------------------------------
 
-    def ensure_consumer_group(self, stream: str, group: str) -> None:
+    def ensure_consumer_group(self, stream: str, group: str, *, start_id: str = "$") -> None:
         """
         Create the consumer group if it doesn't exist.
 
-        Uses id="$" so a freshly started skill only receives events produced
-        *after* startup — it does not replay historical insights.
-        Pass id="0" if you want to replay from the beginning of the stream.
+        Uses id="$" by default so a freshly started skill only receives events
+        produced *after* startup. Pass ``start_id="0"`` to replay from the
+        beginning of the stream.
         """
         try:
-            self._r.xgroup_create(stream, group, id="$", mkstream=True)
+            self._r.xgroup_create(stream, group, id=start_id, mkstream=True)
             logger.info("Created consumer group '%s' on stream '%s'.", group, stream)
         except redis_lib.exceptions.ResponseError as exc:
             if "BUSYGROUP" not in str(exc):

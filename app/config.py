@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     job_key_prefix: str = "job:"
     job_ttl_seconds: int = 86400
     caption_key_prefix: str = "caption:"
+    caption_ttl_seconds: int = 172800
     max_chunk_seconds: float = 600.0
     min_chunk_seconds: float = 0.5
     max_sources_per_job: int = 32
@@ -41,10 +42,13 @@ class Settings(BaseSettings):
     caption_retry_limit: int = 3
     caption_claim_idle_ms: int = 60_000
     caption_poll_block_ms: int = 5_000
+    backpressure_poll_seconds: float = 1.0
+    max_backpressure_wait_seconds: float = 1800.0
     preserve_audio_artifacts: bool = False
     frame_batch_retention_seconds: int = 1800
     frame_batch_failed_retention_seconds: int = 7200
     preserve_chunk_artifacts: bool = False
+    enable_direct_chat_completions: bool = False
 
     # OpenClaw event bus — set OPENCLAW_BUS_ENABLED=true to publish to Redis Streams
     openclaw_bus_enabled: bool = False

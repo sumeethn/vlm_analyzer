@@ -14,14 +14,15 @@ services:
   video-ingest-api:
     build: .
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    restart: unless-stopped
     ports:
       - "8000:8000"
     environment:
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
-      OLLAMA_BASE_URL: http://host.docker.internal:11434
       FRAME_BATCH_ROOT: /var/lib/nova/frame_batches
       VIDEO_MOUNT: /data/videos
+      ENABLE_DIRECT_CHAT_COMPLETIONS: "false"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -33,7 +34,8 @@ services:
 
   video-ingest-worker:
     build: .
-    command: celery -A app.worker.celery_app worker --loglevel=info --concurrency=1
+    command: celery -A app.worker.celery_app worker --loglevel=info --concurrency=${INGEST_WORKER_CONCURRENCY:-2}
+    restart: unless-stopped
     environment:
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
@@ -55,6 +57,7 @@ services:
   vlm-captioner:
     build: .
     command: python -m app.vlm_captioner.consumer
+    restart: unless-stopped
     environment:
       REDIS_URL: redis://redis:6379/0
       OLLAMA_BASE_URL: http://host.docker.internal:11434
@@ -63,6 +66,7 @@ services:
       FRAME_BATCH_STREAM_GROUP: vlm-captioner
       FRAME_BATCH_STREAM_CONSUMER: consumer-1
       CAPTION_RETRY_LIMIT: "3"
+      CAPTION_TTL_SECONDS: "172800"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

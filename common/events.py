@@ -27,6 +27,7 @@ class InsightEvent(TypedDict):
     """
 
     insight_id: str
+    batch_id: str
     ts: str
     stream_id: str
     job_id: str
@@ -89,5 +90,5 @@ class CaptionReadyFields(TypedDict):
     model: str
     manifest_path: str
     caption_text: str
-    completion_json: str
+    completion_path: str
     created_at: str

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import shutil
 import time
+from urllib.parse import urlsplit, urlunsplit
 import uuid
 from pathlib import Path
 from typing import Any
@@ -25,6 +27,16 @@ class FrameBatchStorage:
 
     def build_batch_dir(self, source_scope: str, source_id: str, batch_id: str) -> Path:
         return self._root / source_scope / source_id / batch_id
+
+    @staticmethod
+    def sanitize_source_uri(source_uri: str) -> str:
+        parts = urlsplit(source_uri)
+        if not parts.username and not parts.password:
+            return source_uri
+        hostname = parts.hostname or ""
+        port = f":{parts.port}" if parts.port else ""
+        netloc = f"{hostname}{port}"
+        return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
     def write_batch(
         self,
@@ -80,7 +92,7 @@ class FrameBatchStorage:
             source_scope=source_scope,
             source_id=source_id,
             source_type=source_type,
-            source_uri=source_uri,
+            source_uri=self.sanitize_source_uri(source_uri),
             source_index=source_index,
             chunk_index=chunk_index,
             chunk_seconds=chunk_seconds,
@@ -116,6 +128,18 @@ class FrameBatchStorage:
         )
         return manifest
 
+    def write_completion(
+        self,
+        manifest: FrameBatchManifest,
+        completion: dict[str, Any],
+    ) -> str:
+        completion_path = Path(manifest.manifest_path or "").with_name("completion.json")
+        completion_path.write_text(
+            json.dumps(completion, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return str(completion_path)
+
     def mark_manifest(
         self,
         manifest_path: str,
@@ -146,6 +170,8 @@ class FrameBatchStorage:
             except Exception:
                 continue
             if manifest.cleanup_after_ts is None or manifest.cleanup_after_ts > now:
+                continue
+            if manifest.status not in {"captioned", "failed"}:
                 continue
             batch_dir = manifest_path.parent
             shutil.rmtree(batch_dir, ignore_errors=True)

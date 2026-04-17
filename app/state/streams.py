@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from collections.abc import Callable
 from typing import Any, cast
 
 import redis
@@ -61,6 +62,71 @@ class StreamStore:
         data["updated_at"] = time.time()
         sid = data["stream_id"]
         self._r.set(self._key(sid), json.dumps(data))
+
+    def update(
+        self,
+        stream_id: str,
+        mutator: Callable[[dict[str, Any]], dict[str, Any] | None],
+    ) -> dict[str, Any] | None:
+        key = self._key(stream_id)
+        with self._r.pipeline() as pipe:
+            while True:
+                try:
+                    pipe.watch(key)
+                    raw = pipe.get(key)
+                    if not raw:
+                        pipe.unwatch()
+                        return None
+                    current = json.loads(raw)
+                    updated = mutator(current)
+                    if updated is None:
+                        pipe.unwatch()
+                        return current
+                    updated["updated_at"] = time.time()
+                    pipe.multi()
+                    pipe.set(key, json.dumps(updated))
+                    pipe.execute()
+                    return updated
+                except redis.WatchError:
+                    continue
+                finally:
+                    pipe.reset()
+
+    def update_once(
+        self,
+        stream_id: str,
+        *,
+        marker: str,
+        marker_ttl_seconds: int,
+        mutator: Callable[[dict[str, Any]], dict[str, Any] | None],
+    ) -> tuple[dict[str, Any] | None, bool]:
+        key = self._key(stream_id)
+        with self._r.pipeline() as pipe:
+            while True:
+                try:
+                    pipe.watch(key, marker)
+                    raw = pipe.get(key)
+                    if not raw:
+                        pipe.unwatch()
+                        return None, False
+                    if pipe.exists(marker):
+                        pipe.unwatch()
+                        return json.loads(raw), False
+                    current = json.loads(raw)
+                    updated = mutator(current)
+                    if updated is None:
+                        pipe.unwatch()
+                        return current, False
+                    updated["updated_at"] = time.time()
+                    pipe.multi()
+                    pipe.set(key, json.dumps(updated))
+                    pipe.setex(marker, marker_ttl_seconds, "1")
+                    pipe.execute()
+                    return updated, True
+                except redis.WatchError:
+                    continue
+                finally:
+                    pipe.reset()
 
     def delete(self, stream_id: str) -> None:
         self._r.delete(self._key(stream_id))

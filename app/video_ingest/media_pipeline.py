@@ -7,7 +7,12 @@ import time
 from pathlib import Path
 
 from app.config import Settings
-from app.services.chunker import segment_to_jpg, segment_to_mp4, source_has_audio
+from app.services.chunker import (
+    extract_spaced_jpegs_from_mp4,
+    segment_to_jpg,
+    segment_to_mp4,
+    source_has_audio,
+)
 from common.contracts.frame_batch import FrameBatchManifest
 
 from app.video_ingest.storage import FrameBatchStorage
@@ -62,6 +67,26 @@ def _frame_groups(frame_paths: list[Path], frames_per_chunk: int, max_chunks: in
     return groups
 
 
+def _chunk_frames_from_mp4(
+    *,
+    chunk_paths: list[Path],
+    frames_per_chunk: int,
+    frames_root: Path,
+    use_nvdec: bool,
+) -> list[list[Path]]:
+    groups: list[list[Path]] = []
+    for chunk_index, chunk_path in enumerate(chunk_paths):
+        group = extract_spaced_jpegs_from_mp4(
+            chunk_path,
+            out_dir=frames_root / f"chunk_{chunk_index:06d}",
+            stem="frame",
+            n=frames_per_chunk,
+            use_nvdec=use_nvdec,
+        )
+        groups.append(group)
+    return groups
+
+
 def create_file_batches(
     *,
     settings: Settings,
@@ -75,21 +100,13 @@ def create_file_batches(
     max_chunks: int,
     chunk_format: str,
     work_dir: Path,
+    processing_config: dict[str, object],
 ) -> list[FrameBatchManifest]:
     source_dir = work_dir / str(source_index)
     source_dir.mkdir(parents=True, exist_ok=True)
-    frame_paths = segment_to_jpg(
-        uri=source_uri,
-        kind=source_kind,
-        out_dir=source_dir / "frames_raw",
-        chunk_seconds=chunk_seconds,
-        use_nvdec=settings.enable_nvdec,
-        frames_per_chunk=frames_per_chunk,
-        max_chunks=max_chunks,
-    )
-    groups = _frame_groups(frame_paths, frames_per_chunk, max_chunks)
 
     chunk_paths: list[Path] = []
+    groups: list[list[Path]]
     if _optional_chunk_artifact_needed(settings, chunk_format):
         chunk_paths = segment_to_mp4(
             uri=source_uri,
@@ -99,18 +116,38 @@ def create_file_batches(
             use_nvdec=settings.enable_nvdec,
             max_chunks=max_chunks,
         )
+        groups = _chunk_frames_from_mp4(
+            chunk_paths=chunk_paths,
+            frames_per_chunk=frames_per_chunk,
+            frames_root=source_dir / "frames_raw",
+            use_nvdec=settings.enable_nvdec,
+        )
+    else:
+        frame_paths = segment_to_jpg(
+            uri=source_uri,
+            kind=source_kind,
+            out_dir=source_dir / "frames_raw",
+            chunk_seconds=chunk_seconds,
+            use_nvdec=settings.enable_nvdec,
+            frames_per_chunk=frames_per_chunk,
+            max_chunks=max_chunks,
+        )
+        groups = _frame_groups(frame_paths, frames_per_chunk, max_chunks)
 
-    has_audio = source_has_audio(source_uri, source_kind)
     manifests: list[FrameBatchManifest] = []
     source_scope, source_id = _source_scope_ids(job_id, None)
+    ingest_started_at = time.time()
+    has_audio = source_has_audio(source_uri, source_kind)
     for chunk_index, frame_group in enumerate(groups):
         chunk_path = chunk_paths[chunk_index] if chunk_index < len(chunk_paths) else None
         audio_path = None
+        batch_has_audio = has_audio
         if settings.preserve_audio_artifacts and has_audio and chunk_path is not None:
             audio_path = _extract_audio_from_chunk(
                 chunk_path,
                 source_dir / f"audio_{chunk_index:06d}.m4a",
             )
+            batch_has_audio = audio_path is not None
         manifest = storage.write_batch(
             source_scope=source_scope,
             source_id=source_id,
@@ -119,15 +156,21 @@ def create_file_batches(
             source_index=source_index,
             chunk_index=chunk_index,
             chunk_seconds=chunk_seconds,
-            chunk_start_ts=chunk_index * chunk_seconds,
-            chunk_end_ts=(chunk_index + 1) * chunk_seconds,
+            chunk_start_ts=ingest_started_at + (chunk_index * chunk_seconds),
+            chunk_end_ts=ingest_started_at + ((chunk_index + 1) * chunk_seconds),
             frame_paths=frame_group,
             job_id=job_id,
             stream_id=None,
-            has_audio=has_audio,
+            has_audio=batch_has_audio,
             audio_source=audio_path,
             chunk_source=chunk_path,
-            metadata={"chunk_format": chunk_format},
+            metadata={
+                "chunk_format": chunk_format,
+                "chunk_offset_seconds": chunk_index * chunk_seconds,
+                "chunk_time_basis": "source_offset",
+                "processing_config": processing_config,
+                "audio_detected": batch_has_audio,
+            },
         )
         manifests.append(manifest)
     return manifests
@@ -144,26 +187,15 @@ def create_stream_batch(
     chunk_format: str,
     chunk_index: int,
     work_dir: Path,
+    has_audio: bool,
+    processing_config: dict[str, object],
 ) -> FrameBatchManifest | None:
     if work_dir.exists():
         shutil.rmtree(work_dir, ignore_errors=True)
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    frame_paths = segment_to_jpg(
-        uri=source_uri,
-        kind="rtsp",
-        out_dir=work_dir / "frames_raw",
-        chunk_seconds=chunk_seconds,
-        use_nvdec=settings.enable_nvdec,
-        frames_per_chunk=frames_per_chunk,
-        max_chunks=1,
-    )
-    groups = _frame_groups(frame_paths, frames_per_chunk, 1)
-    if not groups:
-        return None
-
     chunk_path = None
-    has_audio = source_has_audio(source_uri, "rtsp")
+    groups: list[list[Path]]
     if _optional_chunk_artifact_needed(settings, chunk_format):
         chunk_paths = segment_to_mp4(
             uri=source_uri,
@@ -174,6 +206,27 @@ def create_stream_batch(
             max_chunks=1,
         )
         chunk_path = chunk_paths[0] if chunk_paths else None
+        if chunk_path is None:
+            return None
+        groups = _chunk_frames_from_mp4(
+            chunk_paths=[chunk_path],
+            frames_per_chunk=frames_per_chunk,
+            frames_root=work_dir / "frames_raw",
+            use_nvdec=settings.enable_nvdec,
+        )
+    else:
+        frame_paths = segment_to_jpg(
+            uri=source_uri,
+            kind="rtsp",
+            out_dir=work_dir / "frames_raw",
+            chunk_seconds=chunk_seconds,
+            use_nvdec=settings.enable_nvdec,
+            frames_per_chunk=frames_per_chunk,
+            max_chunks=1,
+        )
+        groups = _frame_groups(frame_paths, frames_per_chunk, 1)
+    if not groups:
+        return None
 
     audio_path = None
     if settings.preserve_audio_artifacts and has_audio and chunk_path is not None:
@@ -197,5 +250,10 @@ def create_stream_batch(
         has_audio=has_audio,
         audio_source=audio_path,
         chunk_source=chunk_path,
-        metadata={"chunk_format": chunk_format},
+        metadata={
+            "chunk_format": chunk_format,
+            "chunk_time_basis": "wall_clock",
+            "processing_config": processing_config,
+            "audio_detected": has_audio,
+        },
     )

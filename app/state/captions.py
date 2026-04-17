@@ -12,6 +12,7 @@ class CaptionStore:
     def __init__(self, settings: Settings) -> None:
         self._r = redis.from_url(settings.redis_url, decode_responses=True)
         self._prefix = settings.caption_key_prefix
+        self._ttl = settings.caption_ttl_seconds
 
     def _key(self, batch_id: str) -> str:
         return f"{self._prefix}{batch_id}"
@@ -24,7 +25,7 @@ class CaptionStore:
 
     def save(self, record: CaptionRecord) -> None:
         record.updated_at = time.time()
-        self._r.set(self._key(record.batch_id), record.to_json())
+        self._r.setex(self._key(record.batch_id), self._ttl, record.to_json())
 
     def exists(self, batch_id: str) -> bool:
         return bool(self._r.exists(self._key(batch_id)))

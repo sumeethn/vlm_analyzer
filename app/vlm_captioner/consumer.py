@@ -26,15 +26,6 @@ logging.basicConfig(
 logger = logging.getLogger("vlm_captioner")
 
 
-def _append_unique_bounded(values: list[str], item: str, *, limit: int = 256) -> tuple[list[str], bool]:
-    if item in values:
-        return values, False
-    next_values = values + [item]
-    if len(next_values) > limit:
-        next_values = next_values[-limit:]
-    return next_values, True
-
-
 def _caption_text(completion: dict[str, Any]) -> str:
     try:
         return str(completion["choices"][0]["message"]["content"] or "")
@@ -44,8 +35,16 @@ def _caption_text(completion: dict[str, Any]) -> str:
 
 def _runtime_config_for_batch(
     settings: Settings,
+    manifest: FrameBatchManifest,
     event: FrameBatchReadyEvent,
 ) -> tuple[str, str, dict[str, Any] | None]:
+    processing_config = manifest.metadata.get("processing_config")
+    if isinstance(processing_config, dict):
+        model = processing_config.get("model")
+        prompt = processing_config.get("prompt")
+        if isinstance(model, str) and isinstance(prompt, str):
+            options = processing_config.get("ollama_options")
+            return model, prompt, options if isinstance(options, dict) else {}
     if event.job_id:
         job = JobStore(settings).get(event.job_id)
         if not job:
@@ -62,85 +61,107 @@ def _runtime_config_for_batch(
 def _append_job_result(
     settings: Settings,
     manifest: FrameBatchManifest,
-    completion: dict[str, Any],
-) -> None:
-    if not manifest.job_id:
-        return
+    record: CaptionRecord,
+) -> CaptionRecord:
+    if not manifest.job_id or record.job_result_recorded or not record.completion:
+        return record
     store = JobStore(settings)
-    job = store.get(manifest.job_id)
-    if not job:
-        return
-    results = list(job.get("results", []))
-    is_new = not any(item.get("batch_id") == manifest.batch_id for item in results)
-    if is_new:
-        results.append(
-            {
-                "batch_id": manifest.batch_id,
-                "source_index": manifest.source_index,
-                "chunk_index": manifest.chunk_index,
-                "artifact_path": manifest.frame_paths[0] if manifest.frame_paths else "",
-                "artifact_paths": list(manifest.frame_paths),
-                "manifest_path": manifest.manifest_path,
-                "completion": completion,
-            }
-        )
-    job["results"] = results
-    job["chunks_done"] = max(int(job.get("chunks_done", 0)), len(results))
-    if is_new:
-        job["pending_batches"] = max(0, int(job.get("pending_batches", 0)) - 1)
-    if int(job.get("chunks_total", 0)) and int(job["chunks_done"]) >= int(job["chunks_total"]):
-        job["status"] = "completed"
-        job["error"] = None
-    store.save(job)
+    completion = record.completion
+
+    def _mutate(job: dict[str, Any]) -> dict[str, Any]:
+        results = list(job.get("results", []))
+        if not any(item.get("batch_id") == manifest.batch_id for item in results):
+            results.append(
+                {
+                    "batch_id": manifest.batch_id,
+                    "source_index": manifest.source_index,
+                    "chunk_index": manifest.chunk_index,
+                    "artifact_path": manifest.frame_paths[0] if manifest.frame_paths else "",
+                    "artifact_paths": list(manifest.frame_paths),
+                    "manifest_path": manifest.manifest_path,
+                    "completion": completion,
+                }
+            )
+            job["pending_batches"] = max(0, int(job.get("pending_batches", 0)) - 1)
+        job["results"] = results
+        job["chunks_done"] = max(int(job.get("chunks_done", 0)), len(results))
+        if int(job.get("chunks_total", 0)) and int(job["chunks_done"]) >= int(job["chunks_total"]):
+            job["status"] = "completed"
+            job["error"] = None
+        return job
+
+    if store.update(manifest.job_id, _mutate):
+        record.job_result_recorded = True
+    return record
 
 
-def _mark_job_failed(settings: Settings, job_id: str, batch_id: str, error: str) -> None:
+def _mark_job_failed(settings: Settings, job_id: str, record: CaptionRecord, error: str) -> CaptionRecord:
+    if record.job_failure_recorded:
+        return record
     store = JobStore(settings)
-    job = store.get(job_id)
-    if not job:
-        return
-    failed_batch_ids, is_new = _append_unique_bounded(
-        list(job.get("failed_batch_ids", [])),
-        batch_id,
-    )
-    job["status"] = "failed"
-    job["error"] = error
-    job["failed_batch_ids"] = failed_batch_ids
-    if is_new:
+    marker = f"{settings.caption_key_prefix}job-failure:{record.batch_id}"
+
+    def _mutate(job: dict[str, Any]) -> dict[str, Any]:
+        job["status"] = "failed"
+        job["error"] = error
         job["pending_batches"] = max(0, int(job.get("pending_batches", 0)) - 1)
-    store.save(job)
+        return job
+
+    if store.update_once(
+        job_id,
+        marker=marker,
+        marker_ttl_seconds=settings.caption_ttl_seconds,
+        mutator=_mutate,
+    )[1]:
+        record.job_failure_recorded = True
+    return record
 
 
-def _mark_stream_batch_done(settings: Settings, stream_id: str, batch_id: str) -> None:
+def _mark_stream_batch_done(settings: Settings, stream_id: str, record: CaptionRecord) -> CaptionRecord:
+    if record.stream_result_recorded:
+        return record
     store = StreamStore(settings)
-    stream = store.get(stream_id)
-    if not stream:
-        return
-    completed_batch_ids, is_new = _append_unique_bounded(
-        list(stream.get("completed_batch_ids", [])),
-        batch_id,
-    )
-    stream["completed_batch_ids"] = completed_batch_ids
-    if is_new:
+    marker = f"{settings.caption_key_prefix}stream-done:{record.batch_id}"
+
+    def _mutate(stream: dict[str, Any]) -> dict[str, Any]:
         stream["pending_batches"] = max(0, int(stream.get("pending_batches", 0)) - 1)
-    stream["last_error"] = None
-    store.save(stream)
+        stream["last_error"] = None
+        return stream
+
+    if store.update_once(
+        stream_id,
+        marker=marker,
+        marker_ttl_seconds=settings.caption_ttl_seconds,
+        mutator=_mutate,
+    )[1]:
+        record.stream_result_recorded = True
+    return record
 
 
-def _mark_stream_batch_failed(settings: Settings, stream_id: str, batch_id: str, error: str) -> None:
+def _mark_stream_batch_failed(
+    settings: Settings,
+    stream_id: str,
+    record: CaptionRecord,
+    error: str,
+) -> CaptionRecord:
+    if record.stream_failure_recorded:
+        return record
     store = StreamStore(settings)
-    stream = store.get(stream_id)
-    if not stream:
-        return
-    failed_batch_ids, is_new = _append_unique_bounded(
-        list(stream.get("failed_batch_ids", [])),
-        batch_id,
-    )
-    stream["failed_batch_ids"] = failed_batch_ids
-    if is_new:
+    marker = f"{settings.caption_key_prefix}stream-failure:{record.batch_id}"
+
+    def _mutate(stream: dict[str, Any]) -> dict[str, Any]:
         stream["pending_batches"] = max(0, int(stream.get("pending_batches", 0)) - 1)
-    stream["last_error"] = error
-    store.save(stream)
+        stream["last_error"] = error
+        return stream
+
+    if store.update_once(
+        stream_id,
+        marker=marker,
+        marker_ttl_seconds=settings.caption_ttl_seconds,
+        mutator=_mutate,
+    )[1]:
+        record.stream_failure_recorded = True
+    return record
 
 
 def _infer_completion(
@@ -148,7 +169,7 @@ def _infer_completion(
     manifest: FrameBatchManifest,
     event: FrameBatchReadyEvent,
 ) -> tuple[dict[str, Any], str]:
-    model, prompt, options = _runtime_config_for_batch(settings, event)
+    model, prompt, options = _runtime_config_for_batch(settings, manifest, event)
     image_paths = [Path(path) for path in manifest.frame_paths]
     images_b64 = [file_to_base64(path) for path in image_paths]
     ollama_body = ollama_chat_vision(
@@ -169,12 +190,18 @@ def _infer_completion(
 
 def _ensure_publications(
     settings: Settings,
+    captions: CaptionStore,
+    storage: FrameBatchStorage,
+    manifest: FrameBatchManifest,
     record: CaptionRecord,
 ) -> CaptionRecord:
     if not record.completion:
         raise RuntimeError(f"caption record {record.batch_id} is missing completion")
     completion = record.completion
     caption_text = record.caption_text or _caption_text(completion)
+    if not record.completion_path:
+        record.completion_path = storage.write_completion(manifest, completion)
+        captions.save(record)
 
     if not record.caption_event_published:
         publish_caption_ready(
@@ -188,15 +215,17 @@ def _ensure_publications(
                 model=record.model,
                 manifest_path=record.manifest_path,
                 caption_text=caption_text,
-                completion_json=record.completion_json(),
+                completion_path=record.completion_path,
                 created_at=time.time(),
             ),
         )
         record.caption_event_published = True
+        captions.save(record)
 
     if not record.legacy_insight_published:
         publish_legacy_insight(
             settings,
+            batch_id=record.batch_id,
             job_id=record.job_id,
             stream_id=record.stream_id,
             source_index=record.source_index,
@@ -204,6 +233,7 @@ def _ensure_publications(
             completion=completion,
         )
         record.legacy_insight_published = True
+        captions.save(record)
 
     return record
 
@@ -217,29 +247,30 @@ def process_frame_batch(
     manifest = FrameBatchManifest.read_json(Path(event.manifest_path))
     existing = captions.get(event.batch_id)
     if existing and existing.status == "completed":
-        existing = _ensure_publications(settings, existing)
-        captions.save(existing)
+        existing = _ensure_publications(settings, captions, storage, manifest, existing)
         if event.job_id and existing.completion:
-            _append_job_result(settings, manifest, existing.completion)
+            existing = _append_job_result(settings, manifest, existing)
         if event.stream_id:
-            _mark_stream_batch_done(settings, event.stream_id, event.batch_id)
+            existing = _mark_stream_batch_done(settings, event.stream_id, existing)
+        captions.save(existing)
         return
 
     if existing and existing.status == "failed" and existing.attempt >= settings.caption_retry_limit:
         if event.job_id:
-            _mark_job_failed(
+            existing = _mark_job_failed(
                 settings,
                 event.job_id,
-                event.batch_id,
+                existing,
                 existing.error or "caption failed",
             )
         if event.stream_id:
-            _mark_stream_batch_failed(
+            existing = _mark_stream_batch_failed(
                 settings,
                 event.stream_id,
-                event.batch_id,
+                existing,
                 existing.error or "caption failed",
             )
+        captions.save(existing)
         return
 
     attempt = int(existing.attempt if existing else 0) + 1
@@ -265,9 +296,10 @@ def process_frame_batch(
         record.status = "completed"
         record.caption_text = _caption_text(completion)
         record.completion = completion
+        record.completion_path = storage.write_completion(manifest, completion)
         record.error = None
-        record = _ensure_publications(settings, record)
         captions.save(record)
+        record = _ensure_publications(settings, captions, storage, manifest, record)
 
         storage.mark_manifest(
             event.manifest_path,
@@ -277,10 +309,15 @@ def process_frame_batch(
             attempt=record.attempt,
         )
         if event.job_id:
-            _append_job_result(settings, manifest, completion)
+            record = _append_job_result(settings, manifest, record)
         if event.stream_id:
-            _mark_stream_batch_done(settings, event.stream_id, event.batch_id)
+            record = _mark_stream_batch_done(settings, event.stream_id, record)
+        captions.save(record)
     except Exception as exc:
+        if record.status == "completed" and record.completion:
+            record.error = str(exc)
+            captions.save(record)
+            raise
         record.status = "failed"
         record.error = str(exc)
         captions.save(record)
@@ -292,9 +329,10 @@ def process_frame_batch(
                 attempt=record.attempt,
             )
             if event.job_id:
-                _mark_job_failed(settings, event.job_id, event.batch_id, str(exc))
+                record = _mark_job_failed(settings, event.job_id, record, str(exc))
             if event.stream_id:
-                _mark_stream_batch_failed(settings, event.stream_id, event.batch_id, str(exc))
+                record = _mark_stream_batch_failed(settings, event.stream_id, record, str(exc))
+            captions.save(record)
         raise
 
 
@@ -303,6 +341,7 @@ def run_consumer(settings: Settings) -> None:
     bus.ensure_consumer_group(
         settings.frame_batch_ready_stream,
         settings.frame_batch_stream_group,
+        start_id="0",
     )
     shutdown_requested = False
     claim_cursor = "0-0"

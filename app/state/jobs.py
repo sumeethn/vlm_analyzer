@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import Callable
 from typing import Any
 
 import redis
@@ -45,6 +46,77 @@ class JobStore:
                     self._r.setex(key, self.ttl, blob)
         else:
             self._r.setex(key, self.ttl, blob)
+
+    def update(
+        self,
+        job_id: str,
+        mutator: Callable[[dict[str, Any]], dict[str, Any] | None],
+    ) -> dict[str, Any] | None:
+        key = self._key(job_id)
+        with self._r.pipeline() as pipe:
+            while True:
+                try:
+                    pipe.watch(key)
+                    raw = pipe.get(key)
+                    if not raw:
+                        pipe.unwatch()
+                        return None
+                    current = json.loads(raw)
+                    updated = mutator(current)
+                    if updated is None:
+                        pipe.unwatch()
+                        return current
+                    pipe.multi()
+                    try:
+                        pipe.set(key, json.dumps(updated), keepttl=True)
+                    except redis.RedisError:
+                        ttl = self._r.ttl(key)
+                        if ttl is not None and ttl > 0:
+                            pipe.setex(key, ttl, json.dumps(updated))
+                        else:
+                            pipe.setex(key, self.ttl, json.dumps(updated))
+                    pipe.execute()
+                    return updated
+                except redis.WatchError:
+                    continue
+                finally:
+                    pipe.reset()
+
+    def update_once(
+        self,
+        job_id: str,
+        *,
+        marker: str,
+        marker_ttl_seconds: int,
+        mutator: Callable[[dict[str, Any]], dict[str, Any] | None],
+    ) -> tuple[dict[str, Any] | None, bool]:
+        key = self._key(job_id)
+        with self._r.pipeline() as pipe:
+            while True:
+                try:
+                    pipe.watch(key, marker)
+                    raw = pipe.get(key)
+                    if not raw:
+                        pipe.unwatch()
+                        return None, False
+                    if pipe.exists(marker):
+                        pipe.unwatch()
+                        return json.loads(raw), False
+                    current = json.loads(raw)
+                    updated = mutator(current)
+                    if updated is None:
+                        pipe.unwatch()
+                        return current, False
+                    payload = json.dumps(updated)
+                    pipe.multi()
+                    pipe.set(key, payload, keepttl=True)
+                    pipe.setex(marker, marker_ttl_seconds, "1")
+                    pipe.execute()
+                    return updated, True
+                except redis.WatchError:
+                    continue
+                finally:
+                    pipe.reset()
 
     def ping(self) -> bool:
         try:

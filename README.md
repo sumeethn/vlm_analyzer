@@ -53,7 +53,7 @@ FastAPI control-plane service for:
 - `DELETE /v1/streams/{stream_id}`
 - `GET /v1/insights`
 - `GET /v1/streams/{stream_id}/insights`
-- `POST /v1/chat/completions` for compatibility with the existing direct vision endpoint
+- `POST /v1/chat/completions` only when `ENABLE_DIRECT_CHAT_COMPLETIONS=true` for explicit compatibility
 
 ### `video-ingest-worker`
 
@@ -74,6 +74,7 @@ Long-running Redis Streams consumer that:
 - loads the referenced manifest and frames from disk
 - runs VLM inference with the existing Ollama/OpenAI-compat code
 - stores idempotent caption records keyed by `batch_id`
+- writes `completion.json` beside each captioned manifest
 - publishes `caption_ready` to `nova:captions`
 - publishes compatibility insight events to `openclaw:insights`
 
@@ -105,7 +106,7 @@ Each produced batch lives under:
 
 `manifest.json` records:
 
-- source identity: job/stream IDs, source kind, original URI
+- source identity: job/stream IDs, source kind, sanitized source URI
 - sequencing: source index, chunk index, chunk window timestamps
 - artifact pointers: ordered frame paths, optional chunk path, optional audio path
 - replay/debug metadata: creation time, attempt count, cleanup deadline, status
@@ -113,7 +114,7 @@ Each produced batch lives under:
 ## Redis Streams
 
 - `nova:frame_batches`: produced by ingest, consumed by `vlm-captioner`
-- `nova:captions`: produced by `vlm-captioner`, available for future downstream services
+- `nova:captions`: produced by `vlm-captioner`, includes metadata plus `completion_path` instead of embedding large completion payloads in Redis
 - `openclaw:insights`: compatibility stream for existing skills
 - `openclaw:alerts`: emitted by skills and consumed by notifiers
 
@@ -127,9 +128,10 @@ Each produced batch lives under:
 ## Single-GPU Runtime Notes
 
 - `vlm-captioner` is the single inference owner and should run with concurrency `1`.
-- `video-ingest-worker` is conservative by default and should only be scaled after validating GPU contention if NVDEC is enabled.
+- `video-ingest-worker` defaults to Celery concurrency `2` in Compose so multiple RTSP streams can make progress; reduce it if NVDEC or local decode competes with inference on your GPU.
 - Redis is the control plane only; do not store image/audio bytes in Redis.
 - Backpressure is bounded through per-job and per-stream `pending_batches` counters in Redis.
+- Ingest waits only up to `MAX_BACKPRESSURE_WAIT_SECONDS` before failing a stuck producer instead of sleeping forever.
 
 ## Quick Start
 
@@ -194,7 +196,7 @@ Key application settings live in `app/config.py`.
 
 - `REDIS_URL`: Redis for job, stream, insight, caption, and stream state
 - `CELERY_BROKER_URL`: Celery broker for ingest tasks
-- `OLLAMA_BASE_URL`: Ollama base URL used by compatibility chat calls and `vlm-captioner`
+- `OLLAMA_BASE_URL`: Ollama base URL used by `vlm-captioner` and only by `video-ingest-api` when direct chat compatibility is explicitly enabled
 - `FRAME_BATCH_ROOT`: shared filesystem root for canonical frame batches
 - `FRAME_BATCH_READY_STREAM`: Redis stream for ingest-to-captioner work
 - `CAPTION_READY_STREAM`: Redis stream for caption outputs
@@ -202,8 +204,10 @@ Key application settings live in `app/config.py`.
 - `MAX_INFLIGHT_BATCHES_PER_STREAM`: RTSP backlog cap
 - `MAX_INFLIGHT_BATCHES_PER_JOB`: batch-job backlog cap
 - `CAPTION_RETRY_LIMIT`: bounded caption retry count before terminal failure
+- `CAPTION_TTL_SECONDS`: retention for caption records and one-shot publication markers
 - `FRAME_BATCH_RETENTION_SECONDS`: successful batch retention window
 - `FRAME_BATCH_FAILED_RETENTION_SECONDS`: failed batch retention window
+- `ENABLE_DIRECT_CHAT_COMPLETIONS`: opt-in compatibility switch for `POST /v1/chat/completions` on `video-ingest-api`
 - `PRESERVE_AUDIO_ARTIFACTS`: optional per-batch audio extraction
 - `PRESERVE_CHUNK_ARTIFACTS`: optional chunk video retention
 - `OPENCLAW_INSIGHTS_STREAM` and `OPENCLAW_ALERTS_STREAM`: skill/consumer compatibility stream names
@@ -226,7 +230,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 Start the ingest worker:
 
 ```bash
-celery -A app.worker.celery_app worker --loglevel=info --concurrency=1
+celery -A app.worker.celery_app worker --loglevel=info --concurrency=2
 ```
 
 Start the captioner:

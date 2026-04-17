@@ -20,7 +20,7 @@ class CaptionReadyEvent(BaseModel):
     model: str
     manifest_path: str
     caption_text: str
-    completion_json: str
+    completion_path: str | None = None
     created_at: float
 
     def to_stream_fields(self) -> dict[str, str]:
@@ -34,7 +34,7 @@ class CaptionReadyEvent(BaseModel):
             "model": self.model,
             "manifest_path": self.manifest_path,
             "caption_text": self.caption_text,
-            "completion_json": self.completion_json,
+            "completion_path": _as_str(self.completion_path),
             "created_at": str(self.created_at),
         }
 
@@ -49,7 +49,7 @@ class CaptionReadyEvent(BaseModel):
             model=fields["model"],
             manifest_path=fields["manifest_path"],
             caption_text=fields.get("caption_text", ""),
-            completion_json=fields.get("completion_json", "{}"),
+            completion_path=fields.get("completion_path") or None,
             created_at=float(fields["created_at"]),
         )
 
@@ -71,6 +71,11 @@ class CaptionRecord(BaseModel):
     error: str | None = None
     caption_event_published: bool = False
     legacy_insight_published: bool = False
+    completion_path: str | None = None
+    job_result_recorded: bool = False
+    stream_result_recorded: bool = False
+    job_failure_recorded: bool = False
+    stream_failure_recorded: bool = False
 
     def to_json(self) -> str:
         return self.model_dump_json()
