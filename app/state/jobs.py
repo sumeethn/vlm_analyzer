@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import Callable
 from typing import Any
 
 import redis
@@ -34,17 +35,99 @@ class JobStore:
         job_id = data["job_id"]
         key = self._key(job_id)
         blob = json.dumps(data)
-        if self._r.exists(key):
-            try:
-                self._r.set(key, blob, keepttl=True)
-            except redis.RedisError:
+        try:
+            if self._r.exists(key):
                 ttl = self._r.ttl(key)
                 if ttl is not None and ttl > 0:
                     self._r.setex(key, ttl, blob)
                 else:
                     self._r.setex(key, self.ttl, blob)
-        else:
+            else:
+                self._r.setex(key, self.ttl, blob)
+        except redis.RedisError:
             self._r.setex(key, self.ttl, blob)
+
+    def update(
+        self,
+        job_id: str,
+        mutator: Callable[[dict[str, Any]], dict[str, Any] | None],
+    ) -> dict[str, Any] | None:
+        """
+        Optimistic-lock read-modify-write on a job key.
+
+        Reads the current TTL while in WATCH mode and preserves it via
+        setex inside the MULTI block.  This avoids keepttl=True (Redis 6.0+
+        only) and the dead try/except pattern that could never fire inside a
+        MULTI block.
+        """
+        key = self._key(job_id)
+        with self._r.pipeline() as pipe:
+            while True:
+                try:
+                    pipe.watch(key)
+                    raw = pipe.get(key)
+                    if not raw:
+                        pipe.unwatch()
+                        return None
+                    current = json.loads(raw)
+                    updated = mutator(current)
+                    if updated is None:
+                        pipe.unwatch()
+                        return current
+                    # Read TTL while still in watch (immediate) mode so we
+                    # can replicate it inside MULTI without keepttl=True.
+                    ttl = pipe.ttl(key)
+                    effective_ttl = ttl if (ttl is not None and ttl > 0) else self.ttl
+                    pipe.multi()
+                    pipe.setex(key, effective_ttl, json.dumps(updated))
+                    pipe.execute()
+                    return updated
+                except redis.WatchError:
+                    continue
+                finally:
+                    pipe.reset()
+
+    def update_once(
+        self,
+        job_id: str,
+        *,
+        marker: str,
+        marker_ttl_seconds: int,
+        mutator: Callable[[dict[str, Any]], dict[str, Any] | None],
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """
+        Idempotent read-modify-write: executes the mutation exactly once,
+        gated by *marker*.  Returns ``(final_state, did_execute)``.
+        """
+        key = self._key(job_id)
+        with self._r.pipeline() as pipe:
+            while True:
+                try:
+                    pipe.watch(key, marker)
+                    raw = pipe.get(key)
+                    if not raw:
+                        pipe.unwatch()
+                        return None, False
+                    if pipe.exists(marker):
+                        pipe.unwatch()
+                        return json.loads(raw), False
+                    current = json.loads(raw)
+                    updated = mutator(current)
+                    if updated is None:
+                        pipe.unwatch()
+                        return current, False
+                    ttl = pipe.ttl(key)
+                    effective_ttl = ttl if (ttl is not None and ttl > 0) else self.ttl
+                    payload = json.dumps(updated)
+                    pipe.multi()
+                    pipe.setex(key, effective_ttl, payload)
+                    pipe.setex(marker, marker_ttl_seconds, "1")
+                    pipe.execute()
+                    return updated, True
+                except redis.WatchError:
+                    continue
+                finally:
+                    pipe.reset()
 
     def ping(self) -> bool:
         try:

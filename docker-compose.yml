@@ -11,44 +11,65 @@ services:
       timeout: 3s
       retries: 5
 
-  api:
+  video-ingest-api:
     build: .
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    restart: unless-stopped
     ports:
       - "8000:8000"
     environment:
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
-      OLLAMA_BASE_URL: http://host.docker.internal:11434
-      TEMP_DIR: /tmp/vlm_jobs
+      FRAME_BATCH_ROOT: /var/lib/nova/frame_batches
       VIDEO_MOUNT: /data/videos
-      ENABLE_NVDEC: "0"
-      OPENCLAW_BUS_ENABLED: "true"
+      ENABLE_DIRECT_CHAT_COMPLETIONS: "false"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - job_temp:/tmp/vlm_jobs
+      - frame_batch_data:/var/lib/nova/frame_batches
       - ./samples:/data/videos:ro
     depends_on:
       redis:
         condition: service_healthy
 
-  worker:
+  video-ingest-worker:
     build: .
-    command: celery -A app.worker.celery_app worker --loglevel=info --concurrency=2
+    command: celery -A app.worker.celery_app worker --loglevel=info --concurrency=${INGEST_WORKER_CONCURRENCY:-2}
+    restart: unless-stopped
     environment:
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
-      OLLAMA_BASE_URL: http://host.docker.internal:11434
       TEMP_DIR: /tmp/vlm_jobs
+      FRAME_BATCH_ROOT: /var/lib/nova/frame_batches
       VIDEO_MOUNT: /data/videos
       ENABLE_NVDEC: "0"
-      OPENCLAW_BUS_ENABLED: "true"
+      OPENCLAW_BUS_ENABLED: "false"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - job_temp:/tmp/vlm_jobs
+      - frame_batch_data:/var/lib/nova/frame_batches
       - ./samples:/data/videos:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  vlm-captioner:
+    build: .
+    command: python -m app.vlm_captioner.consumer
+    restart: unless-stopped
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      FRAME_BATCH_ROOT: /var/lib/nova/frame_batches
+      OPENCLAW_BUS_ENABLED: "true"
+      FRAME_BATCH_STREAM_GROUP: vlm-captioner
+      FRAME_BATCH_STREAM_CONSUMER: consumer-1
+      CAPTION_RETRY_LIMIT: "3"
+      CAPTION_TTL_SECONDS: "172800"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - frame_batch_data:/var/lib/nova/frame_batches
     depends_on:
       redis:
         condition: service_healthy
@@ -62,11 +83,11 @@ services:
     env_file:
       - skills/package_delivery_alert/.env
     environment:
-      VLM_BASE_URL: http://api:8000
+      VLM_BASE_URL: http://video-ingest-api:8000
       REDIS_URL: redis://redis:6379/0
     restart: unless-stopped
     depends_on:
-      - api
+      - video-ingest-api
       - redis
 
   # ── OpenClaw consumers ─────────────────────────────────────────────────────
@@ -85,4 +106,4 @@ services:
 
 volumes:
   redis_data:
-  job_temp:
+  frame_batch_data:

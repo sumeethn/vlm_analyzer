@@ -27,6 +27,7 @@ class InsightEvent(TypedDict):
     """
 
     insight_id: str
+    batch_id: str
     ts: str
     stream_id: str
     job_id: str
@@ -57,3 +58,37 @@ class AlertEvent(TypedDict):
     score: str
     matched: str
     excerpt: str
+
+
+class FrameBatchReadyFields(TypedDict):
+    event_type: str
+    batch_id: str
+    source_type: str
+    source_id: str
+    job_id: str
+    stream_id: str
+    source_index: str
+    chunk_index: str
+    chunk_start_ts: str
+    chunk_end_ts: str
+    manifest_path: str
+    frames_dir: str
+    frame_count: str
+    has_audio: str
+    audio_path: str
+    attempt: str
+    created_at: str
+
+
+class CaptionReadyFields(TypedDict):
+    event_type: str
+    batch_id: str
+    job_id: str
+    stream_id: str
+    source_index: str
+    chunk_index: str
+    model: str
+    manifest_path: str
+    caption_text: str
+    completion_path: str
+    created_at: str

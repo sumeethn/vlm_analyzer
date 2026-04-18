@@ -1,265 +1,269 @@
-# Nova — Home Automation Platform
+# Nova — Single-Host Video Ingest + VLM Captioning
 
 ## Overview
 
-Nova is a event-driven home automation built around a **vision-language model (VLM)** microservice. Cameras stream video to the VLM analyzer, which publishes analysis results to a **Redis Streams** message bus. Skills subscribe to the bus, detect events of interest, and publish alerts. Consumers deliver those alerts to notification channels (Discord, etc.).
+Nova now uses a two-service pipeline designed for one machine and one GPU:
 
-```
-[IP Cameras / RTSP Streams]
-         │
-         ▼
-[vlm_analyzer service]          ← FastAPI + Celery + Ollama
-  Chunks video, runs VLM
-         │
-         ▼  xadd
-  Redis Stream: openclaw:insights
-         │
-         │  xreadgroup (fan-out, one consumer group per skill)
-   ┌─────┴──────────────────┐
-   ▼                        ▼
-[package_delivery_alert]  [vehicle_exit_monitor]  ...future skills
-   Detect → publish alert
-         │
-         ▼  xadd
-  Redis Stream: openclaw:alerts
-         │
-         ▼  xreadgroup
-[discord_notifier]        ...future consumers (Slack, SMS, Home Assistant)
+```mermaid
+flowchart LR
+    Sources[RTSPAndFileSources] --> IngestApi[videoIngestApi]
+    IngestApi --> IngestWorker[videoIngestWorker]
+    IngestWorker --> BatchFs[sharedFrameBatchFs]
+    IngestWorker --> FrameBatchStream[nova_frame_batches]
+    FrameBatchStream --> Captioner[vlmCaptioner]
+    BatchFs --> Captioner
+    Captioner --> CaptionStream[nova_captions]
+    Captioner --> InsightStream[openclaw_insights]
+    InsightStream --> Skills[skills]
+    Skills --> AlertStream[openclaw_alerts]
+    AlertStream --> Consumers[consumers]
 ```
 
----
+The key design rules are:
+
+- `video-ingest` owns decode, chunking, frame sampling, frame-batch storage, and control-plane event publication.
+- `vlm-captioner` owns VLM inference, idempotent caption persistence, and publication of `caption_ready` plus compatibility `openclaw:insights` events.
+- Redis carries metadata and control only. Frames and optional audio stay on a shared local filesystem.
+- Frame batches are the canonical unit of work.
 
 ## Repository Layout
 
-| Path | Role |
-|------|------|
-| `app/` | **vlm_analyzer** FastAPI service (API, worker, state, services) |
-| `common/` | Shared SDK: `EventBus` class, event schema TypedDicts |
-| `skills/` | One directory per OpenClaw skill |
-| `skills/package_delivery_alert/` | Detects package deliveries on a front-yard camera |
-| `consumers/` | One directory per notification consumer |
-| `consumers/discord_notifier/` | Forwards alerts from any skill to a Discord webhook |
-| `Dockerfile` | Image for vlm_analyzer API + Celery worker |
-| `docker-compose.yml` | Full stack: Redis, vlm_analyzer, skills, consumers |
-
----
+- `app/video_ingest/`: ingest API routes, Celery ingest tasks, media pipeline helpers, frame-batch storage.
+- `app/vlm_captioner/`: Redis consumer loop, caption processing, caption/insight publishers.
+- `app/state/`: Redis-backed job, stream, insight, and caption persistence.
+- `app/services/`: reusable FFmpeg, Ollama, and compatibility helpers.
+- `common/contracts/`: shared frame-batch and caption event/manifest models.
+- `common/event_bus.py`: shared Redis Streams helper used by services, skills, and consumers.
+- `skills/`: event-driven detectors that subscribe to `openclaw:insights`.
+- `consumers/`: downstream alert sinks.
 
 ## Services
 
-### vlm_analyzer (`app/`)
+### `video-ingest-api`
 
-FastAPI microservice that processes video — live RTSP streams or local files — using a VLM via [Ollama](https://github.com/ollama/ollama). Celery workers handle async chunking and inference.
+FastAPI control-plane service for:
 
-When `OPENCLAW_BUS_ENABLED=true` the worker publishes every VLM completion to the `openclaw:insights` Redis Stream immediately after storing it. This is opt-in so the service can run standalone without OpenClaw.
+- `GET /v1/health`
+- `POST /v1/jobs`
+- `GET /v1/jobs/{job_id}`
+- `GET /v1/jobs/{job_id}/results`
+- `POST /v1/streams`
+- `GET /v1/streams`
+- `GET /v1/streams/{stream_id}`
+- `DELETE /v1/streams/{stream_id}`
+- `GET /v1/insights`
+- `GET /v1/streams/{stream_id}/insights`
+- `POST /v1/chat/completions` only when `ENABLE_DIRECT_CHAT_COMPLETIONS=true` for explicit compatibility
 
-**Key API routes**
+### `video-ingest-worker`
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/v1/health` | Liveness and Redis connectivity |
-| POST | `/v1/jobs` | Queue a file-based video batch job |
-| GET | `/v1/jobs/{job_id}` | Job status and results |
-| POST | `/v1/streams` | Register an RTSP stream for continuous analysis |
-| GET | `/v1/streams` | List active streams |
-| GET | `/v1/streams/{stream_id}` | Stream detail |
-| DELETE | `/v1/streams/{stream_id}` | Stop a stream |
-| GET | `/v1/insights` | Paginated insight list (optional `stream_id` filter) |
-| GET | `/v1/streams/{stream_id}/insights` | Insights for one stream |
-| POST | `/v1/chat/completions` | OpenAI-compatible vision endpoint (proxied to Ollama) |
+Celery worker that:
 
-### common/
+- validates RTSP/file sources
+- samples frames once using FFmpeg/NVDEC-aware helpers
+- writes canonical frame-batch directories under `FRAME_BATCH_ROOT`
+- optionally preserves chunk and audio artifacts
+- publishes `frame_batch_ready` metadata to `nova:frame_batches`
+- enforces bounded producer backpressure via Redis job/stream state
 
-Shared Python package used by all skills and consumers.
+### `vlm-captioner`
 
-- **`event_bus.py`** — `EventBus` class wrapping Redis Streams (`xadd`, `xreadgroup`, `xack`, consumer group management).
-- **`events.py`** — `InsightEvent` and `AlertEvent` TypedDicts documenting the fields present in each stream entry.
+Long-running Redis Streams consumer that:
 
-### Skills (`skills/`)
+- claims or consumes `frame_batch_ready` events
+- loads the referenced manifest and frames from disk
+- runs VLM inference with the existing Ollama/OpenAI-compat code
+- stores idempotent caption records keyed by `batch_id`
+- writes `completion.json` beside each captioned manifest
+- publishes `caption_ready` to `nova:captions`
+- publishes compatibility insight events to `openclaw:insights`
 
-Each skill:
-1. Registers its camera(s) with vlm_analyzer on startup via `POST /v1/streams`.
-2. Subscribes to `openclaw:insights` as a dedicated consumer group.
-3. Filters insights by its own `stream_id`, runs detection logic.
-4. Publishes an `AlertEvent` to `openclaw:alerts` when an event is detected.
-5. Deregisters its streams on shutdown.
+### Skills and consumers
 
-**Available skills**
+Existing skills and consumers remain event-driven:
 
-| Skill | Camera | Event detected |
-|-------|--------|----------------|
-| `package_delivery_alert` | Front yard / porch | Package left at the door |
+- skills still register RTSP streams through `POST /v1/streams`
+- skills still consume `openclaw:insights`
+- consumers still consume `openclaw:alerts`
 
-### Consumers (`consumers/`)
+## Canonical Frame-Batch Layout
 
-Consumers subscribe to `openclaw:alerts` and forward alerts to external channels. They are decoupled from detection — swapping Discord for another channel requires only a new consumer, not changes to any skill.
+Each produced batch lives under:
 
-**Available consumers**
+```text
+<FRAME_BATCH_ROOT>/<jobs|streams>/<source_id>/<batch_id>/
+  manifest.json
+  frames/
+    frame_000000.jpg
+    frame_000001.jpg
+    ...
+  debug/
+    source.json
+  chunk_000000.mp4            # optional
+  audio/
+    audio_000000.m4a          # optional
+```
 
-| Consumer | Destination |
-|----------|-------------|
-| `discord_notifier` | Discord channel via incoming webhook |
+`manifest.json` records:
 
----
+- source identity: job/stream IDs, source kind, sanitized source URI
+- sequencing: source index, chunk index, chunk window timestamps
+- artifact pointers: ordered frame paths, optional chunk path, optional audio path
+- replay/debug metadata: creation time, attempt count, cleanup deadline, status
 
-## Message Bus Streams
+## Redis Streams
 
-| Stream | Producer | Consumer(s) | Content |
-|--------|----------|-------------|---------|
-| `openclaw:insights` | vlm_analyzer worker | Skills (one consumer group each) | VLM completion for every processed video chunk |
-| `openclaw:alerts` | Skills | Consumers (one consumer group each) | Detected event with score, matched signals, and VLM excerpt |
+- `nova:frame_batches`: produced by ingest, consumed by `vlm-captioner`
+- `nova:captions`: produced by `vlm-captioner`, includes metadata plus `completion_path` instead of embedding large completion payloads in Redis
+- `openclaw:insights`: compatibility stream for existing skills
+- `openclaw:alerts`: emitted by skills and consumed by notifiers
 
----
+## Audio Policy
 
-## Quick Start (Docker Compose)
+- Ingest probes each source for audio and records `has_audio` in the manifest/event.
+- Audio is metadata-only by default.
+- If `PRESERVE_AUDIO_ARTIFACTS=true`, ingest extracts one aligned audio artifact per batch when audio is present and a chunk artifact is available.
+- The current captioner ignores audio by default; it is preserved for future STT/omni consumers.
+
+## Single-GPU Runtime Notes
+
+- `vlm-captioner` is the single inference owner and should run with concurrency `1`.
+- `video-ingest-worker` defaults to Celery concurrency `2` in Compose so multiple RTSP streams can make progress; reduce it if NVDEC or local decode competes with inference on your GPU.
+- Redis is the control plane only; do not store image/audio bytes in Redis.
+- Backpressure is bounded through per-job and per-stream `pending_batches` counters in Redis.
+- Ingest waits only up to `MAX_BACKPRESSURE_WAIT_SECONDS` before failing a stuck producer instead of sleeping forever.
+
+## Quick Start
 
 ### Prerequisites
 
 - Docker and Docker Compose
-- [Ollama](https://github.com/ollama/ollama) running on the host with at least one vision model pulled:
-  ```bash
-  ollama pull llava
-  ```
+- Redis via Compose
+- [Ollama](https://github.com/ollama/ollama) running on the host with a vision model, for example:
 
-### 1. Configure skills and consumers
+```bash
+ollama pull llava
+```
+
+### Configure skills and consumers
 
 ```bash
 cp skills/package_delivery_alert/.env.example skills/package_delivery_alert/.env
-cp consumers/discord_notifier/.env.example    consumers/discord_notifier/.env
+cp consumers/discord_notifier/.env.example consumers/discord_notifier/.env
 ```
 
-Edit each `.env` file. Minimum required values:
+Set at least:
 
-**`skills/package_delivery_alert/.env`**
-```
+```dotenv
+# skills/package_delivery_alert/.env
 RTSP_URL=rtsp://user:password@192.168.1.100:554/stream1
 ```
 
-**`consumers/discord_notifier/.env`**
-```
+```dotenv
+# consumers/discord_notifier/.env
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN
 ```
 
-### 2. Start the stack
+### Start the stack
 
 ```bash
 docker compose up --build
 ```
 
-Services started:
+Services:
 
-| Service | Address |
-|---------|---------|
-| vlm_analyzer API | http://localhost:8000 |
-| Redis | localhost:6379 |
-| package_delivery_alert | (no port — event-driven) |
-| discord_notifier | (no port — event-driven) |
+- `video-ingest-api`: [http://localhost:8000](http://localhost:8000)
+- `redis`: `localhost:6379`
+- `video-ingest-worker`: background ingest producer
+- `vlm-captioner`: background caption consumer
+- `package_delivery_alert`: skill example
+- `discord_notifier`: consumer example
 
-### 3. Verify
+### Verify
 
 ```bash
-# API health
 curl -sS http://localhost:8000/v1/health
-
-# Active streams (the skill registers one on startup)
 curl -sS http://localhost:8000/v1/streams
-
-# Recent insights from the bus
+redis-cli XLEN nova:frame_batches
+redis-cli XLEN nova:captions
 redis-cli XLEN openclaw:insights
-
-# Recent alerts
 redis-cli XLEN openclaw:alerts
 ```
 
----
+## Important Configuration
 
-## Configuration Reference
+Key application settings live in `app/config.py`.
 
-### vlm_analyzer (`app/config.py`)
+- `REDIS_URL`: Redis for job, stream, insight, caption, and stream state
+- `CELERY_BROKER_URL`: Celery broker for ingest tasks
+- `OLLAMA_BASE_URL`: Ollama base URL used by `vlm-captioner` and only by `video-ingest-api` when direct chat compatibility is explicitly enabled
+- `FRAME_BATCH_ROOT`: shared filesystem root for canonical frame batches
+- `FRAME_BATCH_READY_STREAM`: Redis stream for ingest-to-captioner work
+- `CAPTION_READY_STREAM`: Redis stream for caption outputs
+- `FRAME_BATCH_STREAM_GROUP`: captioner consumer group name
+- `MAX_INFLIGHT_BATCHES_PER_STREAM`: RTSP backlog cap
+- `MAX_INFLIGHT_BATCHES_PER_JOB`: batch-job backlog cap
+- `CAPTION_RETRY_LIMIT`: bounded caption retry count before terminal failure
+- `CAPTION_TTL_SECONDS`: retention for caption records and one-shot publication markers
+- `FRAME_BATCH_RETENTION_SECONDS`: successful batch retention window
+- `FRAME_BATCH_FAILED_RETENTION_SECONDS`: failed batch retention window
+- `ENABLE_DIRECT_CHAT_COMPLETIONS`: opt-in compatibility switch for `POST /v1/chat/completions` on `video-ingest-api`
+- `PRESERVE_AUDIO_ARTIFACTS`: optional per-batch audio extraction
+- `PRESERVE_CHUNK_ARTIFACTS`: optional chunk video retention
+- `OPENCLAW_INSIGHTS_STREAM` and `OPENCLAW_ALERTS_STREAM`: skill/consumer compatibility stream names
 
-| Variable | Purpose | Default |
-|----------|---------|---------|
-| `REDIS_URL` | Redis for job/stream/insight state | `redis://localhost:6379/0` |
-| `CELERY_BROKER_URL` | Celery broker | `redis://redis:6379/1` |
-| `OLLAMA_BASE_URL` | Ollama HTTP base | `http://127.0.0.1:11434` |
-| `OPENCLAW_BUS_ENABLED` | Publish insights to Redis Streams | `false` |
-| `OPENCLAW_INSIGHTS_STREAM` | Stream key for VLM completions | `openclaw:insights` |
-| `OPENCLAW_ALERTS_STREAM` | Stream key for detected alerts | `openclaw:alerts` |
-| `OPENCLAW_STREAM_MAXLEN` | Maximum entries kept per stream | `10000` |
-| `TEMP_DIR` | Temp workspace for video chunks | `/tmp/vlm_jobs` |
-| `VIDEO_MOUNT` | Root for validated file sources | `/data/videos` |
-| `ENABLE_NVDEC` | NVIDIA hardware decode | `false` |
+## Local Development
 
-### package_delivery_alert skill
+Start Redis:
 
-| Variable | Purpose | Default |
-|----------|---------|---------|
-| `RTSP_URL` | Camera RTSP URL | **required** |
-| `VLM_BASE_URL` | vlm_analyzer API URL | `http://localhost:8000` |
-| `VLM_MODEL` | Ollama model | `llava` |
-| `CHUNK_SECONDS` | Video window per analysis | `30` |
-| `FRAMES_PER_CHUNK` | Frames sampled per chunk | `3` |
-| `REDIS_URL` | Redis for event bus | `redis://localhost:6379/0` |
-| `DETECTION_THRESHOLD` | Minimum score to fire an alert | `2` |
-| `COOLDOWN_SECONDS` | Suppress duplicate alerts | `300` |
+```bash
+redis-server
+```
 
-### discord_notifier consumer
+Start the ingest API:
 
-| Variable | Purpose | Default |
-|----------|---------|---------|
-| `DISCORD_WEBHOOK_URL` | Discord incoming webhook | **required** |
-| `REDIS_URL` | Redis for event bus | `redis://localhost:6379/0` |
-| `DISCORD_MENTION` | Mention string prepended to alerts | *(none)* |
+```bash
+pip install -r requirements.txt
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
 
----
+Start the ingest worker:
 
-## Local Development (without Docker)
+```bash
+celery -A app.worker.celery_app worker --loglevel=info --concurrency=2
+```
 
-1. Start Redis:
-   ```bash
-   redis-server
-   ```
+Start the captioner:
 
-2. Install vlm_analyzer dependencies and start the API:
-   ```bash
-   pip install -r requirements.txt
-   uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-   ```
+```bash
+OPENCLAW_BUS_ENABLED=true python -m app.vlm_captioner.consumer
+```
 
-3. Start a Celery worker:
-   ```bash
-   OPENCLAW_BUS_ENABLED=true celery -A app.worker.celery_app worker --loglevel=info
-   ```
+Run a skill from the repo root:
 
-4. Run a skill (from repo root so `common/` is on the path):
-   ```bash
-   cd skills/package_delivery_alert
-   PYTHONPATH=../.. RTSP_URL=rtsp://... python skill.py
-   ```
+```bash
+cd skills/package_delivery_alert
+PYTHONPATH=../.. RTSP_URL=rtsp://... python skill.py
+```
 
-5. Run a consumer (from repo root):
-   ```bash
-   cd consumers/discord_notifier
-   PYTHONPATH=../.. DISCORD_WEBHOOK_URL=https://... python consumer.py
-   ```
+Run a consumer from the repo root:
 
----
+```bash
+cd consumers/discord_notifier
+PYTHONPATH=../.. DISCORD_WEBHOOK_URL=https://... python consumer.py
+```
 
-## Adding a New Skill
+## Adding New Downstream Consumers
 
-1. Create `skills/<skill_name>/` with `skill.py`, `detector.py`, `config.py`, `.env.example`, `Dockerfile`.
-2. In `skill.py`:
-   - Register camera(s) with vlm_analyzer via `POST /v1/streams`.
-   - Use `EventBus.ensure_consumer_group("openclaw:insights", "<skill_name>")`.
-   - Loop on `EventBus.consume(...)`, filter by `stream_id`, run detection.
-   - On detection call `EventBus.publish("openclaw:alerts", AlertEvent(...))`.
-3. Add `AlertEvent` field `"skill": "<skill_name>"` so consumers can label it.
-4. Add the service to `docker-compose.yml` with build context set to the repo root.
-5. Add a row to the skills table in this README.
+For new detectors or sinks:
 
----
+1. Reuse `common/event_bus.py` for consumer-group management.
+2. Read `openclaw:insights` if you need compatibility with the current skills model.
+3. Prefer `nova:captions` for new services that want the denser caption contract.
+4. Publish alerts to `openclaw:alerts` if you want to interoperate with the existing notification consumers.
 
 ## Further Reading
 
-- Interactive API docs (when the server is running): http://localhost:8000/docs
+- FastAPI docs once running: [http://localhost:8000/docs](http://localhost:8000/docs)
 - [Ollama API](https://github.com/ollama/ollama/blob/main/docs/api.md)
 - [Redis Streams](https://redis.io/docs/data-types/streams/)

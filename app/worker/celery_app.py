@@ -21,4 +21,4 @@ celery_app.conf.update(
     task_track_started=True,
 )
 
-from app.worker import tasks  # noqa: E402,F401
+from app.video_ingest import tasks  # noqa: E402,F401
